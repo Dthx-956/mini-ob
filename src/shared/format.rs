@@ -674,7 +674,7 @@ impl SegmentFooter {
 /// 0x20-0x23  Flags           u32 LE (0=正常, 1=标记删除)
 /// 0x24-0x3F  Reserved        [u8; 28]
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(C)]
 pub struct ManifestEntry {
     pub segment_id: u32,
@@ -941,6 +941,118 @@ impl ParsedSegment {
     }
 }
 
+// ==================== 模块级 Bloom 哈希（供 ChunkSummary 和 SegmentSummary 共享）====================
+
+pub(crate) fn bloom_hash(s: &str, seed: u64) -> usize {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for byte in s.bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h = h.wrapping_add(seed);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    (h % 512) as usize
+}
+
+// ==================== Segment 级摘要（嵌入 ManifestEntry.reserved）====================
+
+/// Segment 级摘要（28 字节），用于免解压统计查询
+///
+/// 构建来源：扫描 Segment v2 文件时，读取 ChunkSummaryTable 汇总
+/// 内存位置：常驻内存（随 Manifest 加载），查询时零磁盘 IO
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct SegmentSummary {
+    /// 0x00-0x07 模板位图（8 bytes）
+    pub pattern_mask: u64,
+    /// 0x08 级别分布（1 byte）
+    pub level_mask: u8,
+    /// 0x09-0x0E 服务名 Bloom Filter（6 bytes = 48 bits, 3 hash）
+    pub service_bloom: [u8; 6],
+    /// 0x0F-0x1A 参数值 Bloom Filter（12 bytes = 96 bits, 2 hash）
+    pub param_bloom: [u8; 12],
+    /// 0x1B 标志（1 byte）
+    pub flags: u8,
+}
+
+impl SegmentSummary {
+    pub const HAS_SUMMARY: u8 = 0x01;
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        if buf.len() < 28 {
+            return Self::default();
+        }
+        let mut service_bloom = [0u8; 6];
+        let mut param_bloom = [0u8; 12];
+        service_bloom.copy_from_slice(&buf[9..15]);
+        param_bloom.copy_from_slice(&buf[15..27]);
+        Self {
+            pattern_mask: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            level_mask: buf[8],
+            service_bloom,
+            param_bloom,
+            flags: buf[27],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 28] {
+        let mut buf = [0u8; 28];
+        buf[0..8].copy_from_slice(&self.pattern_mask.to_le_bytes());
+        buf[8] = self.level_mask;
+        buf[9..15].copy_from_slice(&self.service_bloom);
+        buf[15..27].copy_from_slice(&self.param_bloom);
+        buf[27] = self.flags;
+        buf
+    }
+
+    pub fn has_summary(&self) -> bool {
+        self.flags & Self::HAS_SUMMARY != 0
+    }
+
+    pub fn bloom_may_contain_service(&self, keyword: &str) -> bool {
+        self.check_bloom(keyword, 0, &self.service_bloom)
+    }
+
+    pub fn bloom_may_contain_param(&self, keyword: &str) -> bool {
+        self.check_bloom(keyword, 100, &self.param_bloom)
+    }
+
+    fn check_bloom(&self, keyword: &str, seed_base: u64, bloom: &[u8]) -> bool {
+        let bits = bloom.len() * 8;
+        for i in 0..3 {
+            let pos = bloom_hash(keyword, seed_base + i) % bits;
+            let byte_idx = pos / 8;
+            let bit_idx = pos % 8;
+            if (bloom[byte_idx] >> bit_idx) & 1 == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// ==================== ManifestEntry 扩展 ====================
+
+impl ManifestEntry {
+    /// 从 reserved 字段解析 SegmentSummary
+    pub fn segment_summary(&self) -> SegmentSummary {
+        SegmentSummary::from_bytes(&self.reserved)
+    }
+
+    /// 设置 SegmentSummary 到 reserved 字段，返回自身（链式调用）
+    pub fn with_summary(mut self, summary: &SegmentSummary) -> Self {
+        self.reserved = summary.to_bytes();
+        self
+    }
+}
 // ==================== 单元测试 ====================
 
 #[cfg(test)]

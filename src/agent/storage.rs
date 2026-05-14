@@ -28,7 +28,7 @@ use crate::agent::template::{
 };
 use crate::shared::format::{
     align_up, crc32, padding_needed, segment_name, ChunkEntry, ChunkSummary, LogLine,
-    SegmentFooter, SegmentHeader, ALIGNMENT, CHUNK_ENTRY_SIZE, CHUNK_SUMMARY_SIZE,
+    SegmentFooter, SegmentHeader, SegmentSummary, ALIGNMENT, CHUNK_ENTRY_SIZE, CHUNK_SUMMARY_SIZE,
     FORMAT_VERSION_V1, MIN_SEGMENT_SIZE, SEGMENT_FOOTER_SIZE, SEGMENT_HEADER_SIZE,
 };
 
@@ -197,9 +197,6 @@ impl StorageEngine {
         }
 
         let meta = self.write_segment_v2(&logs)?;
-
-        self.index
-            .add_segment(meta.id, meta.min_ts, meta.max_ts, meta.line_count)?;
 
         self.total_original
             .fetch_add(meta.original_sz as u64, Ordering::Relaxed);
@@ -441,11 +438,34 @@ impl StorageEngine {
         drop(file);
         fs::rename(tmp_path, final_path)?;
 
+        // 构建 SegmentSummary
+        let mut summary = SegmentSummary::default();
+        summary.pattern_mask = chunk_summaries.iter().map(|s| s.pattern_mask).fold(0, |a, b| a | b);
+        summary.level_mask = chunk_summaries.iter().map(|s| s.level_mask).fold(0, |a, b| a | b);
+        for cs in &chunk_summaries {
+            for j in 0..64 {
+                summary.param_bloom[j % 12] |= cs.param_bloom[j];
+            }
+        }
+        summary.flags = SegmentSummary::HAS_SUMMARY;
+
+        let min_ts = logs.iter().map(|l| l.ts).min().unwrap_or(0);
+        let max_ts = logs.iter().map(|l| l.ts).max().unwrap_or(0);
+        let line_count = logs.len() as u32;
+
+        self.index.add_segment_with_summary(
+            id,
+            min_ts,
+            max_ts,
+            line_count,
+            summary,
+        )?;
+
         Ok(SegmentMeta {
             id,
-            min_ts: logs.iter().map(|l| l.ts).min().unwrap_or(0),
-            max_ts: logs.iter().map(|l| l.ts).max().unwrap_or(0),
-            line_count: logs.len() as u32,
+            min_ts,
+            max_ts,
+            line_count,
             original_sz: total_original,
             compressed_sz: total_compressed,
         })
