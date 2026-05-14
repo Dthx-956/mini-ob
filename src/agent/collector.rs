@@ -9,8 +9,8 @@
 //! - 跨平台：纯 Rust 标准库 + serde_json，无系统特定依赖
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -58,8 +58,8 @@ impl Collector {
         let config_clone = config.clone();
         let handle = thread::spawn(move || {
             match config_clone.source {
-                SourceType::File { path } => {
-                    collect_file(path, &config_clone, tx, stop_clone);
+                SourceType::File { ref path } => {
+                    collect_file(path.clone(), &config_clone, tx, stop_clone);
                 }
                 SourceType::Stdin => {
                     collect_stdin(&config_clone, tx, stop_clone);
@@ -301,7 +301,7 @@ fn parse_line(line: &str, default_service: &str) -> Option<LogLine> {
     // 策略1：JSON
     if trimmed.starts_with('{') {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(log) = parse_json_value(json, default_service) {
+            if let Some(log) = parse_json_value(json, default_service, trimmed) {
                 return Some(log);
             }
         }
@@ -322,7 +322,7 @@ fn parse_line(line: &str, default_service: &str) -> Option<LogLine> {
 }
 
 /// 从 JSON Value 提取 LogLine（兼容标准格式和紧凑格式）
-fn parse_json_value(v: serde_json::Value, default_service: &str) -> Option<LogLine> {
+fn parse_json_value(v: serde_json::Value, default_service: &str, fallback_line: &str) -> Option<LogLine> {
     let obj = v.as_object()?;
 
     // 时间戳：兼容 timestamp/ts/time/t
@@ -368,7 +368,7 @@ fn parse_json_value(v: serde_json::Value, default_service: &str) -> Option<LogLi
         .or_else(|| obj.get("log"))
         .or_else(|| obj.get("m"))
         .and_then(|m| m.as_str())
-        .unwrap_or(trimmed)
+        .unwrap_or(fallback_line)
         .to_string();
 
     Some(LogLine {

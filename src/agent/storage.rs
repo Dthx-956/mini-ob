@@ -16,15 +16,15 @@
 //!          多线程并发 append 需由调用方外部同步。
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::agent::compressor::{Compressor, CompressorConfig};
-use crate::agent::index::{Index, IndexStats};
+use crate::agent::index::Index;
 use crate::shared::format::{
-    align_up, crc32, now_ms, segment_name, ChunkEntry, FormatError, LogLine, SegmentFooter,
+    align_up, crc32, now_ms, segment_name, ChunkEntry, LogLine, SegmentFooter,
     SegmentHeader, ALIGNMENT, CHUNK_ENTRY_SIZE, SEGMENT_FOOTER_SIZE, SEGMENT_HEADER_SIZE,
 };
 
@@ -124,7 +124,7 @@ impl StorageEngine {
             .append(true)
             .open(&wal_path)?;
 
-        let mut engine = Self {
+        let engine = Self {
             data_dir,
             config,
             index,
@@ -263,6 +263,8 @@ impl StorageEngine {
             )?;
         }
 
+        // 整体按时间戳降序排列（最新优先）
+        results.sort_by_key(|log| std::cmp::Reverse(log.ts));
         Ok(results)
     }
 
@@ -385,7 +387,7 @@ impl StorageEngine {
         }
 
         // 解析 Header
-        let header = SegmentHeader::from_bytes(&mmap[0..SEGMENT_HEADER_SIZE])
+        let _header = SegmentHeader::from_bytes(&mmap[0..SEGMENT_HEADER_SIZE])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // 解析 Chunk Entry
@@ -480,14 +482,18 @@ impl StorageEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
-        let dir = std::env::temp_dir().join(format!("mini-obs-storage-test-{}", ts));
+            .as_nanos() as u64;
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("mini-obs-storage-test-{}-{}", ts, n));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

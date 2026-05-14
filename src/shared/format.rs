@@ -15,6 +15,29 @@
 use std::fmt;
 use std::io;
 
+use serde::{Deserialize, Serialize};
+
+// ==================== 日志行类型 ====================
+
+/// 单条日志行的内存表示
+///
+/// 序列化格式（JSON 紧凑）：`{"t":u64,"s":"svc","l":"E","m":"msg"}`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogLine {
+    /// Unix 时间戳（毫秒）
+    #[serde(rename = "t")]
+    pub ts: u64,
+    /// 服务名
+    #[serde(rename = "s")]
+    pub service: String,
+    /// 日志级别（单字符：D/I/W/E）
+    #[serde(rename = "l")]
+    pub level: String,
+    /// 消息内容
+    #[serde(rename = "m")]
+    pub message: String,
+}
+
 // ==================== 常量 ====================
 
 /// Segment 文件魔数

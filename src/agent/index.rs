@@ -8,14 +8,14 @@
 //! - 线程安全：读多写少，RwLock 保护
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::shared::format::{
-    align_up, crc32, hash_path, parse_segment_name, segment_name, ChunkEntry, FormatError,
-    ManifestEntry, ManifestHeader, SegmentFooter, SegmentHeader, ALIGNMENT, CHUNK_ENTRY_SIZE,
-    FORMAT_VERSION, MANIFEST_ENTRY_SIZE, MIDX_MAGIC, SEGMENT_FOOTER_SIZE, SEGMENT_HEADER_SIZE,
+    crc32, parse_segment_name, segment_name, ChunkEntry, FormatError,
+    ManifestEntry, ManifestHeader, SegmentHeader, CHUNK_ENTRY_SIZE,
+    MANIFEST_ENTRY_SIZE, SEGMENT_HEADER_SIZE,
 };
 
 /// 索引统计信息
@@ -310,14 +310,19 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::format::{align_up, SegmentFooter, ALIGNMENT};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
-        let dir = std::env::temp_dir().join(format!("mini-obs-index-test-{}", ts));
+            .as_nanos() as u64;
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("mini-obs-index-test-{}-{}", ts, n));
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(dir.join("segments")).unwrap();
         fs::create_dir_all(dir.join("index")).unwrap();
@@ -418,10 +423,12 @@ mod tests {
     #[test]
     fn test_manifest_corruption_rebuild() {
         let dir = temp_dir();
+        let seg_dir = dir.join("segments");
 
-        // 先正常创建并保存
+        // 先创建假 Segment 文件并注册到索引
         {
             let idx = Index::open(&dir).unwrap();
+            create_fake_segment(&seg_dir.join("segment-00000001.mobs"), 1, 1000, 2000, 50).unwrap();
             idx.add_segment(1, 1000, 2000, 50).unwrap();
         }
 
@@ -429,7 +436,7 @@ mod tests {
         let manifest_path = dir.join("index").join("manifest.midx");
         fs::write(&manifest_path, b"CORRUPTED").unwrap();
 
-        // 重新打开应触发重建
+        // 重新打开应触发重建（从 segments 目录扫描）
         let idx = Index::open(&dir).unwrap();
         assert_eq!(idx.stats().segment_count, 1);
         assert_eq!(idx.query_by_id(1).unwrap().line_count, 50);
@@ -475,10 +482,12 @@ mod tests {
     #[test]
     fn test_next_id_monotonic() {
         let dir = temp_dir();
+        let seg_dir = dir.join("segments");
         let idx = Index::open(&dir).unwrap();
 
         assert_eq!(idx.next_segment_id(), 1);
         assert_eq!(idx.next_segment_id(), 2);
+        create_fake_segment(&seg_dir.join("segment-00000002.mobs"), 2, 100, 200, 5).unwrap();
         idx.add_segment(2, 100, 200, 5).unwrap();
         assert_eq!(idx.next_segment_id(), 3);
     }

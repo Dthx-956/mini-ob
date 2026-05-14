@@ -29,7 +29,8 @@ use std::time::Duration;
 /// 边缘 Agent 运行时句柄（轻量封装，不深入 storage 内部格式）
 ///
 /// 使用示例：
-/// ```rust,no_run
+/// ```ignore
+/// use mini_obs::agent::AgentHandle;
 /// let agent = AgentHandle::open("/data/mini-obs", "app").unwrap();
 /// agent.start_tail("/var/log/app.log").unwrap();
 /// // 日志自动流经 collector -> compressor -> storage
