@@ -3,8 +3,8 @@
 //! 边缘日志采集与压缩存储引擎 —— 模块入口
 //!
 //! 当前状态：
-//! - collector / compressor / index / format 已完成并可用
-//! - storage 为旧版实现，待后续重构接入 format.rs 规范
+//! - collector / compressor / index / format / storage 已完成并可用
+//! - storage 已实现 format.rs v2 规范（多 Chunk Segment + PatternTable + ChunkSummary）
 //! - 本 mod.rs 仅做模块声明与重新导出，不耦合 storage 内部格式细节
 
 pub mod collector;

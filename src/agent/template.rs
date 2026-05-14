@@ -8,6 +8,7 @@
 //! - 编码格式：bitmap + literals，紧凑且 SIMD 友好
 
 use std::collections::HashMap;
+use std::io;
 
 use crate::shared::format::LogLine;
 
@@ -336,7 +337,7 @@ impl TemplateExtractor {
     ///   u16  original_len  ← 原始字符串字节长度（解码时截断用）
     ///   [u8] bitmap        ← 每 bit 表示对应块是否非零（1 = 有差异）
     ///   [u8] literals      ← 仅对 bitmap=1 的块存储 8-byte XOR 值
-    fn xor_param_64bit(curr: &str, base: &str) -> Vec<u8> {
+    pub fn xor_param_64bit(curr: &str, base: &str) -> Vec<u8> {
         let curr_b = curr.as_bytes();
         let base_b = base.as_bytes();
         let max_len = ((curr_b.len().max(base_b.len()) + 7) / 8) * 8;
@@ -366,7 +367,7 @@ impl TemplateExtractor {
         result
     }
 
-    fn decode_xor_param_64bit(data: &[u8], base: &str) -> (String, usize) {
+    pub fn decode_xor_param_64bit(data: &[u8], base: &str) -> (String, usize) {
         let num_chunks = u16::from_le_bytes([data[0], data[1]]) as usize;
         let original_len = u16::from_le_bytes([data[2], data[3]]) as usize;
         let bitmap_len = (num_chunks + 7) / 8;
@@ -413,7 +414,7 @@ impl TemplateExtractor {
         (s, lit_offset)
     }
 
-    fn read_u64_le(bytes: &[u8], offset: usize, len: usize) -> u64 {
+    pub fn read_u64_le(bytes: &[u8], offset: usize, len: usize) -> u64 {
         let mut buf = [0u8; 8];
         let avail = len.saturating_sub(offset);
         let copy = avail.min(8).min(bytes.len().saturating_sub(offset));
@@ -568,5 +569,93 @@ mod tests {
         let len2 = u16::from_le_bytes([enc2[2], enc2[3]]);
         assert_eq!(len1, 5);
         assert_eq!(len2, 13);
+    }
+}
+
+// ==================== PatternTable 序列化（供 storage.rs 使用）====================
+
+impl Template {
+    /// 序列化为字节流（TLV 格式）
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.parts.len() as u16).to_le_bytes());
+        for part in &self.parts {
+            match part {
+                TemplatePart::Literal(s) => {
+                    buf.push(0x01);
+                    let bytes = s.as_bytes();
+                    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(bytes);
+                }
+                TemplatePart::Param => {
+                    buf.push(0x02);
+                }
+            }
+        }
+        buf
+    }
+
+    /// 从字节流反序列化
+    pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
+        if data.len() < 2 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "template too short"));
+        }
+        let part_count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let mut offset = 2;
+        let mut parts = Vec::with_capacity(part_count);
+        for _ in 0..part_count {
+            if offset >= data.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "template part tag"));
+            }
+            let tag = data[offset];
+            offset += 1;
+            if tag == 0x01 {
+                if offset + 2 > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "literal len"));
+                }
+                let len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                if offset + len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "literal bytes"));
+                }
+                let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+                parts.push(TemplatePart::Literal(s));
+                offset += len;
+            } else if tag == 0x02 {
+                parts.push(TemplatePart::Param);
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown part tag"));
+            }
+        }
+        Ok((Template { id: 0, parts }, offset))
+    }
+}
+
+impl TemplateBatch {
+    /// 序列化整个 PatternTable
+    pub fn serialize_pattern_table(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.templates.len() as u16).to_le_bytes());
+        for t in &self.templates {
+            buf.extend_from_slice(&t.serialize());
+        }
+        buf
+    }
+
+    /// 从字节流反序列化 PatternTable
+    pub fn deserialize_pattern_table(data: &[u8]) -> io::Result<Vec<Template>> {
+        if data.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let mut offset = 2;
+        let mut templates = Vec::with_capacity(count);
+        for i in 0..count {
+            let (mut t, consumed) = Template::deserialize(&data[offset..])?;
+            t.id = i as u16;
+            templates.push(t);
+            offset += consumed;
+        }
+        Ok(templates)
     }
 }

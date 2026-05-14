@@ -457,8 +457,6 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
-
     #[test]
     fn test_parse_standard_json() {
         let line = r#"{"timestamp":1715424000000,"service":"auth","level":"ERROR","message":"login failed"}"#;

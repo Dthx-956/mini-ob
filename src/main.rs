@@ -79,6 +79,7 @@ fn cmd_agent(args: &[String]) -> io::Result<()> {
             max_buffer_lines: 1000,
             max_buffer_bytes: 64 * 1024,
             compression_level: 3,
+            chunk_size: 256,
             dict: None,
         },
     )?;

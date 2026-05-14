@@ -11,7 +11,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::agent::template::{EncodedRecord, TemplateBatch, TemplateExtractor};
+use crate::agent::template::{EncodedRecord, TemplateExtractor};
 use crate::shared::format::LogLine;
 
 // ==================== 配置 ====================
@@ -129,21 +129,32 @@ impl Compressor {
         use crate::agent::template::{ParamEncoding, TemplateExtractor, TemplatePart};
 
         let mut offset = 0;
+        let check = |offset, len| {
+            if offset + len > data.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "template deserialize truncated"));
+            }
+            Ok(())
+        };
 
         // 解析模板字典
+        check(offset, 2)?;
         let tmpl_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
         let mut templates = Vec::with_capacity(tmpl_count);
         for _ in 0..tmpl_count {
+            check(offset, 2)?;
             let part_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
             let mut parts = Vec::with_capacity(part_count);
             for _ in 0..part_count {
+                check(offset, 1)?;
                 let tag = data[offset];
                 offset += 1;
                 if tag == 0x01 {
+                    check(offset, 2)?;
                     let len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
                     offset += 2;
+                    check(offset, len)?;
                     let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
                     offset += len;
                     parts.push(TemplatePart::Literal(s));
@@ -155,6 +166,7 @@ impl Compressor {
         }
 
         // 解析记录
+        check(offset, 4)?;
         let rec_count = u32::from_le_bytes([
             data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
         ]) as usize;
@@ -165,13 +177,16 @@ impl Compressor {
         let mut ref_params: Vec<String> = Vec::new();
 
         for rec_idx in 0..rec_count {
+            check(offset, 8)?;
             let ts_delta = i64::from_le_bytes([
                 data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
                 data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
             ]);
             offset += 8;
+            check(offset, 1)?;
             let svc_id = data[offset];
             offset += 1;
+            check(offset, 1)?;
             let level = match data[offset] {
                 b'D' => "D".to_string(),
                 b'I' => "I".to_string(),
@@ -180,14 +195,18 @@ impl Compressor {
                 _ => "I".to_string(),
             };
             offset += 1;
+            check(offset, 2)?;
             let pat_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
             offset += 2;
+            check(offset, 2)?;
             let ref_idx = u16::from_le_bytes([data[offset], data[offset + 1]]);
             offset += 2;
+            check(offset, 4)?;
             let enc_len = u32::from_le_bytes([
                 data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
             ]) as usize;
             offset += 4;
+            check(offset, enc_len)?;
             let enc_data = &data[offset..offset + enc_len];
             offset += enc_len;
 

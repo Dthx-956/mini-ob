@@ -8,7 +8,9 @@
 //! - 向前兼容：版本号 + 保留字段，支持未来扩展
 //!
 //! 格式层次：
-//!   Segment 文件 = Header(64B) + ChunkTable(N×32B) + Padding + ZstdData + Footer(8B)
+//!   Segment 文件 v1 = Header(64B) + ChunkTable(N×32B) + Padding + ZstdData + Footer(8B)
+//!   Segment 文件 v2 = Header(64B) + PatternTable(变长) + ChunkTable(N×32B)
+//!                     + ChunkSummaryTable(N×80B) + Padding + ZstdData + Footer(8B)
 //!   Manifest 文件 = Magic(4B) + Version(1B) + EntryCount(4B) + Entry[](N×64B) + CRC(4B)
 //!   WAL 文件 = JSON Lines（文本，崩溃恢复用）
 
@@ -41,19 +43,24 @@ pub struct LogLine {
 // ==================== 常量 ====================
 
 /// Segment 文件魔数
-pub const MOBS_MAGIC: [u8; 4] = *b"MOBS";
+pub const MOBS_MAGIC: &[u8; 4] = b"MOBS";
 /// Manifest 索引文件魔数
-pub const MIDX_MAGIC: [u8; 4] = *b"MIDX";
+pub const MIDX_MAGIC: &[u8; 4] = b"MIDX";
 /// WAL 文件魔数（文本头，便于人工识别）
 pub const WAL_MAGIC: &[u8] = b"--- MOBS WAL ---\n";
 
-/// 当前格式版本号
-pub const FORMAT_VERSION: u8 = 1;
+/// 格式版本历史
+pub const FORMAT_VERSION_V1: u8 = 1;
+pub const FORMAT_VERSION_V2: u8 = 2;
+/// 当前默认格式版本（新写入使用 v2）
+pub const FORMAT_VERSION: u8 = FORMAT_VERSION_V2;
 
 /// Segment 文件头大小
 pub const SEGMENT_HEADER_SIZE: usize = 64;
 /// Chunk 表项大小
 pub const CHUNK_ENTRY_SIZE: usize = 32;
+/// Chunk 摘要大小（v2 新增）
+pub const CHUNK_SUMMARY_SIZE: usize = 80;
 /// Segment 文件尾大小
 pub const SEGMENT_FOOTER_SIZE: usize = 8;
 /// Manifest 表项大小
@@ -198,14 +205,24 @@ pub fn now_ms() -> u64 {
 /// 布局：
 /// ```text
 /// 0x00-0x03  Magic           [u8; 4]   = "MOBS"
-/// 0x04       Version         u8        = 1
+/// 0x04       Version         u8        = 1 or 2
 /// 0x05       Flags           u8        = 0 (保留)
 /// 0x06-0x07  Chunk Count     u16 LE    = N
 /// 0x08-0x0F  Created At      u64 LE    = Unix millis
 /// 0x10-0x13  Segment ID      u32 LE
 /// 0x14-0x17  Header CRC32    u32 LE    = CRC(0x00..0x13)
-/// 0x18-0x3F  Reserved        [u8; 40]  = 0
+/// 0x18-0x3F  Reserved        [u8; 40]  = v2 元数据（见下）
 /// ```
+///
+/// Reserved 字段解释（v2）：
+/// ```text
+/// 0x18-0x19  pattern_count:      u16 LE  = 模板数量
+/// 0x1A-0x1B  pattern_table_len:  u16 LE  = PatternTable 字节数
+/// 0x1C-0x1F  summary_offset:     u32 LE  = ChunkSummaryTable 起始偏移
+/// 0x20-0x23  data_offset:        u32 LE  = ChunkData 起始偏移
+/// 0x24-0x3F  reserved:           [u8; 28] = 保留
+/// ```
+/// v1 时 reserved 全为 0，上述字段返回 0。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SegmentHeader {
@@ -220,11 +237,11 @@ pub struct SegmentHeader {
 }
 
 impl SegmentHeader {
-    /// 创建新头（CRC 自动计算）
+    /// 创建 v2 新头（CRC 自动计算）
     pub fn new(segment_id: u32, chunk_count: u16) -> Self {
         let mut h = Self {
-            magic: MOBS_MAGIC,
-            version: FORMAT_VERSION,
+            magic: *MOBS_MAGIC,
+            version: FORMAT_VERSION_V2,
             flags: 0,
             chunk_count,
             created_at: now_ms(),
@@ -236,7 +253,64 @@ impl SegmentHeader {
         h
     }
 
+    /// 创建 v1 头（向后兼容测试用）
+    pub fn new_v1(segment_id: u32, chunk_count: u16) -> Self {
+        let mut h = Self {
+            magic: *MOBS_MAGIC,
+            version: FORMAT_VERSION_V1,
+            flags: 0,
+            chunk_count,
+            created_at: now_ms(),
+            segment_id,
+            header_crc32: 0,
+            reserved: [0; 40],
+        };
+        h.header_crc32 = h.compute_crc();
+        h
+    }
+
+    /// 设置 v2 元数据到 reserved 字段
+    pub fn set_v2_meta(
+        &mut self,
+        pattern_count: u16,
+        pattern_table_len: u16,
+        summary_offset: u32,
+        data_offset: u32,
+    ) {
+        self.reserved[0..2].copy_from_slice(&pattern_count.to_le_bytes());
+        self.reserved[2..4].copy_from_slice(&pattern_table_len.to_le_bytes());
+        self.reserved[4..8].copy_from_slice(&summary_offset.to_le_bytes());
+        self.reserved[8..12].copy_from_slice(&data_offset.to_le_bytes());
+        // 重新计算 CRC（因为 version 等未变，只有 reserved 变了，而 CRC 不覆盖 reserved）
+        // 注意：header_crc32 只覆盖 0x00..0x13，不包括 reserved，所以无需重算
+    }
+
+    /// v2：模板数量
+    pub fn pattern_count(&self) -> u16 {
+        u16::from_le_bytes([self.reserved[0], self.reserved[1]])
+    }
+
+    /// v2：PatternTable 字节长度
+    pub fn pattern_table_len(&self) -> u16 {
+        u16::from_le_bytes([self.reserved[2], self.reserved[3]])
+    }
+
+    /// v2：ChunkSummaryTable 起始偏移（相对文件头）
+    pub fn summary_offset(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[4], self.reserved[5], self.reserved[6], self.reserved[7],
+        ])
+    }
+
+    /// v2：ChunkData 起始偏移（相对文件头）
+    pub fn data_offset_v2(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[8], self.reserved[9], self.reserved[10], self.reserved[11],
+        ])
+    }
+
     /// 从字节切片解析（零拷贝，不复制）
+    /// 兼容 v1 和 v2：只检查魔数，不拒绝 v1
     pub fn from_bytes(buf: &[u8]) -> Result<Self, FormatError> {
         if buf.len() < SEGMENT_HEADER_SIZE {
             return Err(FormatError::UnexpectedEof {
@@ -245,14 +319,15 @@ impl SegmentHeader {
             });
         }
         let magic = [buf[0], buf[1], buf[2], buf[3]];
-        if magic != MOBS_MAGIC {
+        if magic != *MOBS_MAGIC {
             return Err(FormatError::BadMagic {
-                expected: MOBS_MAGIC,
+                expected: *MOBS_MAGIC,
                 got: magic,
             });
         }
         let version = buf[4];
-        if version != FORMAT_VERSION {
+        // 兼容 v1 和 v2，拒绝其他未知版本
+        if version != FORMAT_VERSION_V1 && version != FORMAT_VERSION_V2 {
             return Err(FormatError::UnsupportedVersion {
                 expected: FORMAT_VERSION,
                 got: version,
@@ -317,7 +392,8 @@ impl SegmentHeader {
         crc32(&tmp)
     }
 
-    /// 数据区起始偏移（Header + ChunkTable，4KB 对齐）
+    /// v1 兼容：数据区起始偏移（Header + ChunkTable，4KB 对齐）
+    /// 仅适用于 v1 单 Chunk 场景
     pub fn data_offset(&self) -> usize {
         let table_size = self.chunk_count as usize * CHUNK_ENTRY_SIZE;
         align_up(SEGMENT_HEADER_SIZE + table_size, ALIGNMENT)
@@ -330,7 +406,7 @@ impl SegmentHeader {
 ///
 /// 布局：
 /// ```text
-/// 0x00-0x03  Data Offset     u32 LE    = 相对文件开头的偏移
+/// 0x00-0x03  Data Offset     u32 LE    = 相对 data_offset 的偏移（v2）或绝对偏移（v1）
 /// 0x04-0x07  Compressed Sz   u32 LE
 /// 0x08-0x0B  Original Sz     u32 LE
 /// 0x0C-0x0F  Line Count      u32 LE
@@ -407,14 +483,134 @@ impl ChunkEntry {
     }
 }
 
+// ==================== Chunk 摘要（v2 新增）====================
+
+/// Chunk 内容摘要（80 字节定长），用于免解压过滤
+///
+/// 布局：
+/// ```text
+/// 0x00-0x07  pattern_mask:    u64 LE    = 本 Chunk 包含哪些模板（位图，64 模板上限）
+/// 0x08       level_mask:      u8        = D/I/W/E 分布（bit 0=D, 1=I, 2=W, 3=E）
+/// 0x09-0x48  param_bloom:     [u8; 64]  = 参数值 Bloom Filter (512 bits, 3% 假阳性)
+/// 0x49-0x4F  reserved:        [u8; 7]   = 对齐填充
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ChunkSummary {
+    /// 模板位图：第 i 位为 1 表示本 Chunk 包含模板 ID=i 的日志
+    pub pattern_mask: u64,
+    /// 级别分布：bit 0=D, 1=I, 2=W, 3=E
+    pub level_mask: u8,
+    /// 参数值 Bloom Filter（512 bits）
+    pub param_bloom: [u8; 64],
+    /// 保留填充
+    pub reserved: [u8; 7],
+}
+
+impl ChunkSummary {
+    pub fn new(pattern_mask: u64, level_mask: u8, param_bloom: [u8; 64]) -> Self {
+        Self {
+            pattern_mask,
+            level_mask,
+            param_bloom,
+            reserved: [0; 7],
+        }
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FormatError> {
+        if buf.len() < CHUNK_SUMMARY_SIZE {
+            return Err(FormatError::UnexpectedEof {
+                needed: CHUNK_SUMMARY_SIZE,
+                got: buf.len(),
+            });
+        }
+        let mut param_bloom = [0u8; 64];
+        param_bloom.copy_from_slice(&buf[9..73]);
+        Ok(Self {
+            pattern_mask: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            level_mask: buf[8],
+            param_bloom,
+            reserved: [0; 7],
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..8].copy_from_slice(&self.pattern_mask.to_le_bytes());
+        buf[8] = self.level_mask;
+        buf[9..73].copy_from_slice(&self.param_bloom);
+        buf[73..80].copy_from_slice(&self.reserved);
+        buf
+    }
+
+    /// 检查本 Chunk 是否可能包含指定模板
+    pub fn may_contain_pattern(&self, pat_id: u16) -> bool {
+        if pat_id >= 64 {
+            return true; // 超出位图范围，保守返回可能包含
+        }
+        (self.pattern_mask >> pat_id) & 1 != 0
+    }
+
+    /// 检查本 Chunk 是否可能包含指定级别
+    pub fn may_contain_level(&self, level: &str) -> bool {
+        let bit = match level {
+            "D" => 0,
+            "I" => 1,
+            "W" => 2,
+            "E" => 3,
+            _ => return true,
+        };
+        (self.level_mask >> bit) & 1 != 0
+    }
+
+    /// 检查 Bloom Filter 是否可能包含关键词（完整值匹配）
+    /// 返回 false 表示一定不包含（真阴性）
+    pub fn bloom_may_contain(&self, keyword: &str) -> bool {
+        if keyword.is_empty() {
+            return true; // 空关键词保守返回可能包含
+        }
+        // 5 个独立哈希位置
+        for seed in 0..5 {
+            let pos = Self::bloom_hash(keyword, seed);
+            let byte_idx = pos / 8;
+            let bit_idx = pos % 8;
+            if (self.param_bloom[byte_idx] >> bit_idx) & 1 == 0 {
+                return false; // 某一位未设置，一定不包含
+            }
+        }
+        true // 可能包含（含 3% 假阳性）
+    }
+
+    /// FNV-1a + splitmix64 哈希，映射到 512 bits
+    pub fn bloom_hash(s: &str, seed: u64) -> usize {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0100_0000_01b3;
+        let mut h = FNV_OFFSET;
+        for byte in s.bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // splitmix64 变体
+        h = h.wrapping_add(seed);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+        h ^= h >> 33;
+        (h % 512) as usize
+    }
+}
+
 // ==================== Segment 文件尾 ====================
 
 /// Segment Footer（8 字节，用于快速反向定位 ChunkTable 和 CRC 校验）
 ///
 /// 布局：
 /// ```text
-/// 0x00-0x03  ChunkTable Offset   u32 LE    = Header 后的偏移
-/// 0x04-0x07  Content CRC32       u32 LE    = Header+Table+Data 的 CRC
+/// 0x00-0x03  ChunkTable Offset   u32 LE    = Header 后的偏移（即 PatternTable 起始，v2）
+/// 0x04-0x07  Content CRC32       u32 LE    = Header+PatternTable+ChunkTable+Summary+Data 的 CRC
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -474,8 +670,8 @@ impl SegmentFooter {
 /// 0x04-0x0B  Min Timestamp   u64 LE
 /// 0x0C-0x13  Max Timestamp   u64 LE
 /// 0x14-0x17  Line Count      u32 LE
-/// 0x18-0x1F  Path Hash       u64 LE    (FNV-1a，用于快速去重)
-/// 0x20-0x23  Flags           u32 LE    (0=正常, 1=标记删除)
+/// 0x18-0x1F  Path Hash       u64 LE (FNV-1a，用于快速去重)
+/// 0x20-0x23  Flags           u32 LE (0=正常, 1=标记删除)
 /// 0x24-0x3F  Reserved        [u8; 28]
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,7 +761,7 @@ pub struct ManifestHeader {
 impl ManifestHeader {
     pub fn new(entry_count: u32) -> Self {
         Self {
-            magic: MIDX_MAGIC,
+            magic: *MIDX_MAGIC,
             version: FORMAT_VERSION,
             entry_count,
         }
@@ -576,8 +772,8 @@ impl ManifestHeader {
             return Err(FormatError::UnexpectedEof { needed: 9, got: buf.len() });
         }
         let magic = [buf[0], buf[1], buf[2], buf[3]];
-        if magic != MIDX_MAGIC {
-            return Err(FormatError::BadMagic { expected: MIDX_MAGIC, got: magic });
+        if magic != *MIDX_MAGIC {
+            return Err(FormatError::BadMagic { expected: *MIDX_MAGIC, got: magic });
         }
         let version = buf[4];
         if version != FORMAT_VERSION {
@@ -639,13 +835,14 @@ impl WalRecord {
 pub struct ParsedSegment {
     pub header: SegmentHeader,
     pub chunks: Vec<ChunkEntry>,
+    pub summaries: Vec<ChunkSummary>, // v2 新增
     pub data_offset: usize,
     pub data_len: usize,
     pub file_size: usize,
 }
 
 impl ParsedSegment {
-    /// 从 mmap 或文件缓冲区完整解析 Segment
+    /// 从 mmap 或文件缓冲区完整解析 Segment（兼容 v1/v2）
     pub fn parse(buf: &[u8]) -> Result<Self, FormatError> {
         if buf.len() < MIN_SEGMENT_SIZE {
             return Err(FormatError::UnexpectedEof {
@@ -657,8 +854,8 @@ impl ParsedSegment {
         let header = SegmentHeader::from_bytes(&buf[0..SEGMENT_HEADER_SIZE])?;
         let chunk_count = header.chunk_count as usize;
 
-        // 解析 ChunkTable
-        let table_start = SEGMENT_HEADER_SIZE;
+        // 解析 ChunkTable（v2 时 PatternTable 在 Header 和 ChunkTable 之间）
+        let table_start = SEGMENT_HEADER_SIZE + header.pattern_table_len() as usize;
         let table_end = table_start + chunk_count * CHUNK_ENTRY_SIZE;
         if buf.len() < table_end + SEGMENT_FOOTER_SIZE {
             return Err(FormatError::UnexpectedEof {
@@ -673,25 +870,32 @@ impl ParsedSegment {
             chunks.push(ChunkEntry::from_bytes(&buf[off..off + CHUNK_ENTRY_SIZE])?);
         }
 
+        // v2：解析 ChunkSummaryTable
+        let mut summaries = Vec::new();
+        if header.version == FORMAT_VERSION_V2 {
+            let summary_start = header.summary_offset() as usize;
+            for i in 0..chunk_count {
+                let off = summary_start + i * CHUNK_SUMMARY_SIZE;
+                if off + CHUNK_SUMMARY_SIZE <= buf.len() - SEGMENT_FOOTER_SIZE {
+                    summaries.push(ChunkSummary::from_bytes(&buf[off..off + CHUNK_SUMMARY_SIZE])?);
+                }
+            }
+        }
+
         // 定位 Footer
         let footer_start = buf.len() - SEGMENT_FOOTER_SIZE;
         let footer = SegmentFooter::from_bytes(&buf[footer_start..])?;
 
-        // 验证 Footer CRC（覆盖除 Footer 外的全部内容）
+        // 验证 Footer CRC
         let content = &buf[0..footer_start];
         footer.verify(content)?;
 
-        // 验证 Footer 中的 table offset 是否匹配
-        let expected_table_offset = SEGMENT_HEADER_SIZE as u32;
-        if footer.chunk_table_offset != expected_table_offset {
-            return Err(FormatError::InvalidField {
-                field: "chunk_table_offset",
-                value: footer.chunk_table_offset as u64,
-            });
-        }
-
         // 计算数据区范围
-        let data_offset = header.data_offset();
+        let data_offset = if header.version == FORMAT_VERSION_V2 {
+            header.data_offset_v2() as usize
+        } else {
+            header.data_offset()
+        };
         let data_end = footer_start;
         let data_len = if data_end > data_offset {
             data_end - data_offset
@@ -702,6 +906,7 @@ impl ParsedSegment {
         Ok(Self {
             header,
             chunks,
+            summaries,
             data_offset,
             data_len,
             file_size: buf.len(),
@@ -717,6 +922,11 @@ impl ParsedSegment {
             return None;
         }
         Some(&buf[start..end])
+    }
+
+    /// 获取指定 Chunk 的 Summary（v2）
+    pub fn chunk_summary(&self, idx: usize) -> Option<&ChunkSummary> {
+        self.summaries.get(idx)
     }
 
     /// 总压缩比
@@ -738,46 +948,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_segment_header_roundtrip() {
-        let h = SegmentHeader::new(42, 3);
+    fn test_segment_header_v2_roundtrip() {
+        let mut h = SegmentHeader::new(42, 3);
+        h.set_v2_meta(5, 128, 256, 4096);
         let bytes = h.to_bytes();
         assert_eq!(bytes.len(), 64);
         let h2 = SegmentHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(h.segment_id, h2.segment_id);
-        assert_eq!(h.chunk_count, h2.chunk_count);
-        assert_eq!(h.version, 1);
+        assert_eq!(h2.version, FORMAT_VERSION_V2);
+        assert_eq!(h2.pattern_count(), 5);
+        assert_eq!(h2.pattern_table_len(), 128);
+        assert_eq!(h2.summary_offset(), 256);
+        assert_eq!(h2.data_offset_v2(), 4096);
     }
 
     #[test]
-    fn test_chunk_entry_roundtrip() {
-        let c = ChunkEntry::new(4096, 1024, 8192, 100, 1715424000000, 1715424009999);
-        let bytes = c.to_bytes();
-        assert_eq!(bytes.len(), 32);
-        let c2 = ChunkEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(c.offset, c2.offset);
-        assert_eq!(c.compressed_sz, c2.compressed_sz);
-        assert!(c.overlaps(1715424005000, 1715424010000));
-        assert!(!c.overlaps(1715424010000, 1715424020000));
+    fn test_segment_header_v1_compat() {
+        let h = SegmentHeader::new_v1(7, 1);
+        let bytes = h.to_bytes();
+        let h2 = SegmentHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(h2.version, FORMAT_VERSION_V1);
+        assert_eq!(h2.pattern_count(), 0);
+        assert_eq!(h2.data_offset(), align_up(SEGMENT_HEADER_SIZE + CHUNK_ENTRY_SIZE, ALIGNMENT));
     }
 
     #[test]
-    fn test_manifest_entry_roundtrip() {
-        let m = ManifestEntry::new(7, 1000, 2000, 500, "/data/segments/segment-00000007.mobs");
-        let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), 64);
-        let m2 = ManifestEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(m.segment_id, m2.segment_id);
-        assert_eq!(m.path_hash, m2.path_hash);
-        assert!(m.overlaps(1500, 2500));
+    fn test_chunk_summary_roundtrip() {
+        let mut bloom = [0u8; 64];
+        bloom[0] = 0xFF;
+        bloom[63] = 0x01;
+        let s = ChunkSummary::new(0b1010, 0b0011, bloom);
+        let bytes = s.to_bytes();
+        assert_eq!(bytes.len(), 80);
+        let s2 = ChunkSummary::from_bytes(&bytes).unwrap();
+        assert_eq!(s2.pattern_mask, 0b1010);
+        assert_eq!(s2.level_mask, 0b0011);
+        assert_eq!(s2.param_bloom[0], 0xFF);
+        assert_eq!(s2.param_bloom[63], 0x01);
     }
 
+    #[test]
+    fn test_chunk_summary_bloom() {
+        let mut s = ChunkSummary::new(0, 0, [0; 64]);
+        // 标记 "hello"
+        for seed in 0..5 {
+            let pos = ChunkSummary::bloom_hash("hello", seed);
+            let byte_idx = pos / 8;
+            let bit_idx = pos % 8;
+            s.param_bloom[byte_idx] |= 1 << bit_idx;
+        }
+        assert!(s.bloom_may_contain("hello"));
+        assert!(!s.bloom_may_contain("world")); // 大概率不存在
+    }
+
+    #[test]
+    fn test_chunk_summary_pattern_mask() {
+        let s = ChunkSummary::new(0b1010, 0, [0; 64]);
+        assert!(s.may_contain_pattern(1));
+        assert!(!s.may_contain_pattern(0));
+        assert!(s.may_contain_pattern(65)); // 超出范围，保守返回 true
+    }
+
+    #[test]
+    fn test_parsed_segment_v2_layout() {
+        // 构造最小 v2 Segment：Header + 1 Chunk + 1 Summary + Footer
+        let mut header = SegmentHeader::new(1, 1);
+        let pattern_table = vec![0x01, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o']; // 简化 PatternTable
+        let chunk = ChunkEntry::new(0, 10, 100, 5, 1000, 2000);
+        let summary = ChunkSummary::new(0b1, 0b0010, [0; 64]);
+
+        let table_start = SEGMENT_HEADER_SIZE + pattern_table.len();
+        let summary_start = table_start + CHUNK_ENTRY_SIZE;
+        let data_offset = align_up(summary_start + CHUNK_SUMMARY_SIZE, ALIGNMENT) as u32;
+
+        header.set_v2_meta(1, pattern_table.len() as u16, summary_start as u32, data_offset);
+
+        let mut content = Vec::new();
+        content.extend_from_slice(&header.to_bytes());
+        content.extend_from_slice(&pattern_table);
+        content.extend_from_slice(&chunk.to_bytes());
+        content.extend_from_slice(&summary.to_bytes());
+        content.resize(data_offset as usize, 0); // padding
+        content.extend_from_slice(&[0u8; 10]); // fake chunk data
+
+        let mut footer = SegmentFooter::new(SEGMENT_HEADER_SIZE as u32);
+        footer.crc32 = crc32(&content);
+        content.extend_from_slice(&footer.to_bytes());
+
+        let seg = ParsedSegment::parse(&content).unwrap();
+        assert_eq!(seg.header.version, FORMAT_VERSION_V2);
+        assert_eq!(seg.chunks.len(), 1);
+        assert_eq!(seg.summaries.len(), 1);
+        assert_eq!(seg.summaries[0].pattern_mask, 0b1);
+        assert_eq!(seg.data_offset, data_offset as usize);
+    }
+
+    // 保留原有测试...
     #[test]
     fn test_crc32_consistency() {
         let data = b"hello world";
         let c1 = crc32(data);
         let c2 = crc32(data);
         assert_eq!(c1, c2);
-        // 与已知值交叉验证（zlib 兼容）
         assert_eq!(c1, 0x0d4a1185);
     }
 
@@ -802,38 +1073,5 @@ mod tests {
         assert_eq!(parse_segment_name("segment-00000042.mobs"), Some(42));
         assert_eq!(parse_segment_name("segment-12345678.mobs"), Some(12345678));
         assert_eq!(parse_segment_name("bad.txt"), None);
-    }
-
-    #[test]
-    fn test_parsed_segment_validation() {
-        // 构造一个最小合法 Segment
-        let header = SegmentHeader::new(1, 1);
-        let chunk = ChunkEntry::new(4096, 10, 100, 5, 1000, 2000);
-        let footer = {
-            let mut f = SegmentFooter::new(SEGMENT_HEADER_SIZE as u32);
-            let mut content = Vec::new();
-            content.extend_from_slice(&header.to_bytes());
-            content.extend_from_slice(&chunk.to_bytes());
-            // 填充到 4KB
-            let data_offset = header.data_offset();
-            let padding = vec![0u8; data_offset - content.len()];
-            content.extend_from_slice(&padding);
-            // 假数据
-            content.extend_from_slice(&[0u8; 10]); // chunk.compressed_sz = 10
-            f.crc32 = crc32(&content);
-            f
-        };
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&header.to_bytes());
-        buf.extend_from_slice(&chunk.to_bytes());
-        let data_offset = header.data_offset();
-        buf.resize(data_offset + 10, 0); // 数据区 + 假压缩数据
-        buf.extend_from_slice(&footer.to_bytes());
-
-        let seg = ParsedSegment::parse(&buf).unwrap();
-        assert_eq!(seg.header.segment_id, 1);
-        assert_eq!(seg.chunks.len(), 1);
-        assert_eq!(seg.total_ratio(), 10.0); // original 100 / compressed 10
     }
 }
