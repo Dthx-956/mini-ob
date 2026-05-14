@@ -11,10 +11,11 @@ pub mod collector;
 pub mod compressor;
 pub mod index;
 pub mod storage;
+pub mod template;
 
 // ---------- 重新导出：简化外部调用 ----------
 pub use collector::{Collector, CollectorConfig, SourceType};
-pub use compressor::{Compressor, CompressorConfig, DictTrainer};
+pub use compressor::{Compressor, CompressorConfig};
 pub use index::{Index, IndexStats};
 
 // storage 模块保留公开，但外部建议仅通过以下类型交互，避免依赖其内部旧格式

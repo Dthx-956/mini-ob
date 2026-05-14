@@ -306,8 +306,7 @@ impl StorageEngine {
         let chunk_offset = align_up(SEGMENT_HEADER_SIZE + CHUNK_ENTRY_SIZE, ALIGNMENT) as u32;
 
         // Header
-        let mut header = SegmentHeader::new(id, 1); // 单 Chunk 简化模型
-        header.created_at = now_ms();
+        let header = SegmentHeader::new(id, 1); // 单 Chunk 简化模型
         let header_bytes = header.to_bytes();
 
         // Chunk Entry
@@ -482,20 +481,10 @@ impl StorageEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_util::temp_dir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mini-obs-storage-test-{}-{}", ts, n));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir() -> PathBuf {
+        temp_dir("mini-obs-storage-test")
     }
 
     fn make_log(ts: u64, svc: &str, lvl: &str, msg: &str) -> LogLine {
@@ -509,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_open_empty_and_append() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
 
         engine
@@ -523,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_flush_and_query() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 3,
             ..Default::default()
@@ -556,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_wal_crash_recovery() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 100, // 设置很大，避免自动 flush
             ..Default::default()
@@ -583,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_compression_ratio_high_repeat() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 1000,
             ..Default::default()
@@ -611,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_time_range_descending() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 2,
             ..Default::default()
@@ -632,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_multiple_segments_query() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 1, // 每条都 flush，产生多个 Segment
             ..Default::default()
@@ -654,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_empty_query() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
         let res = engine.query(0, 100, "none", 10).unwrap();
         assert!(res.is_empty());
@@ -662,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_large_batch_stability() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let cfg = StorageConfig {
             max_buffer_lines: 500,
             ..Default::default()

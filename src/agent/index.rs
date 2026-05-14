@@ -311,19 +311,10 @@ impl Index {
 mod tests {
     use super::*;
     use crate::shared::format::{align_up, SegmentFooter, ALIGNMENT};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_util::temp_dir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mini-obs-index-test-{}-{}", ts, n));
-        fs::create_dir_all(&dir).unwrap();
+    fn test_dir() -> PathBuf {
+        let dir = temp_dir("mini-obs-index-test");
         fs::create_dir_all(dir.join("segments")).unwrap();
         fs::create_dir_all(dir.join("index")).unwrap();
         dir
@@ -352,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_open_empty_and_allocate_id() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let idx = Index::open(&dir).unwrap();
 
         assert_eq!(idx.stats().segment_count, 0);
@@ -362,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_add_and_query_range() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let idx = Index::open(&dir).unwrap();
 
         // 注册 5 个 Segment，时间交错
@@ -393,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_query_by_id() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let idx = Index::open(&dir).unwrap();
         idx.add_segment(42, 1000, 2000, 10).unwrap();
 
@@ -403,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_persistence_and_reload() {
-        let dir = temp_dir();
+        let dir = test_dir();
         {
             let idx = Index::open(&dir).unwrap();
             idx.add_segment(1, 1000, 2000, 100).unwrap();
@@ -422,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_manifest_corruption_rebuild() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let seg_dir = dir.join("segments");
 
         // 先创建假 Segment 文件并注册到索引
@@ -444,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_from_segments() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let seg_dir = dir.join("segments");
 
         // 直接创建 3 个假 Segment 文件，无 manifest
@@ -465,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_stats_accuracy() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let idx = Index::open(&dir).unwrap();
 
         idx.add_segment(1, 1000, 2000, 10).unwrap();
@@ -481,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_next_id_monotonic() {
-        let dir = temp_dir();
+        let dir = test_dir();
         let seg_dir = dir.join("segments");
         let idx = Index::open(&dir).unwrap();
 

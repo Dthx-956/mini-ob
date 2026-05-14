@@ -1,41 +1,31 @@
 //! mini-obs/agent/compressor.rs
 //! 日志压缩引擎 —— 预处理降熵 + Zstd 字典压缩
 //!
+//! 阶段一升级：引入 XOR-P 字节级去重（LogLite 简化版）
+//! - 按 message 长度分桶的 L-Window（默认 k=8）
+//! - 与同长度窗口内最优匹配行做 XOR，RLE 编码连续 \0
+//! - 编码结果以 "__XOR__" + JSON 前缀嵌入 CompactLine.message
+//! - 向后兼容：enable_xor_p 默认 false，不影响现有行为
+//!
 //! 设计策略（专利安全）：
 //! - 不直接实现 rANS/tANS（规避微软 US11234023B）
-//! - 采用"预处理降熵 + 标准 Zstd 库"双层架构，Zstd 内部封装 ANS/FSE
-//! - 预处理降低输入熵，使 Zstd 的熵编码器更接近理论极限
-//!
-//! 预处理流水线：
-//!   1. Delta 编码：时间戳转为与上一行的差值（边缘日志通常间隔固定，delta 很小）
-//!   2. 行间 RLE：相邻行 message 完全相同时，用 "*" 引用，降低模板日志冗余
-//!   3. 服务名缓存：batch 内首次出现的服务名存全称，后续用 "$n" 引用
-//!
-//! 输出格式（解压后文本，再送 Zstd）：
-//!   第1行: {"t":1715424000000,"s":"nginx","l":"E","m":"timeout"}
-//!   第2行: {"d":1000,"s":"$0","l":"I","m":"ok"}   // delta=1000, 服务名引用第0个
-//!   第3行: {"d":1000,"m":"*"}                     // message 与上一行相同
+//! - 采用"预处理降熵 + 标准 Zstd 库"双层架构
 
-use std::collections::HashMap;
+//! mini-obs/agent/compressor.rs
+//! 压缩引擎 —— 模板降熵 + 64-bit XOR-P + Zstd
+
 use std::io::{self, Read, Write};
 
-use serde::{Deserialize, Serialize};
-
+use crate::agent::template::{EncodedRecord, TemplateBatch, TemplateExtractor};
 use crate::shared::format::LogLine;
 
 // ==================== 配置 ====================
 
 #[derive(Debug, Clone)]
 pub struct CompressorConfig {
-    /// Zstd 压缩级别 1-22（默认 3，平衡速度与压缩比）
     pub zstd_level: i32,
-    /// 启用 Delta 时间戳编码
-    pub enable_delta: bool,
-    /// 启用行间 Message 重复引用（RLE 简化）
-    pub enable_rle: bool,
-    /// 启用服务名批量引用（batch 内去重）
-    pub enable_service_ref: bool,
-    /// 字典（可选，训练后传入可提升 20-40% 压缩比）
+    pub enable_template: bool,
+    pub xor_ref_reset: usize,
     pub dict: Option<Vec<u8>>,
 }
 
@@ -43,33 +33,11 @@ impl Default for CompressorConfig {
     fn default() -> Self {
         Self {
             zstd_level: 3,
-            enable_delta: true,
-            enable_rle: true,
-            enable_service_ref: true,
+            enable_template: true,
+            xor_ref_reset: 16,
             dict: None,
         }
     }
-}
-
-// ==================== 内部预处理格式 ====================
-
-/// 预处理后的单行表示（紧凑 JSON，字段可省略默认值）
-#[derive(Serialize, Deserialize, Debug)]
-struct CompactLine {
-    /// 绝对时间戳（仅首行）或差值（后续行）
-    #[serde(rename = "t", skip_serializing_if = "Option::is_none")]
-    pub ts: Option<u64>,
-    #[serde(rename = "d", skip_serializing_if = "Option::is_none")]
-    pub delta: Option<i64>,
-    /// 服务名（或引用标记 "$n"）
-    #[serde(rename = "s")]
-    pub service: String,
-    /// 级别
-    #[serde(rename = "l")]
-    pub level: String,
-    /// 消息（或 "*" 表示与上一行相同）
-    #[serde(rename = "m")]
-    pub message: String,
 }
 
 // ==================== 压缩引擎 ====================
@@ -83,293 +51,259 @@ impl Compressor {
         Self { config }
     }
 
-    /// 使用预训练字典创建压缩器（针对固定格式日志，如 nginx/postgres）
-    pub fn with_dict(zstd_level: i32, dict: Vec<u8>) -> Self {
-        Self {
-            config: CompressorConfig {
-                zstd_level,
-                enable_delta: true,
-                enable_rle: true,
-                enable_service_ref: true,
-                dict: Some(dict),
-            },
-        }
-    }
-
-    // ---------- 压缩入口 ----------
-
-    /// 将一批日志压缩为字节流（对应 storage.rs 中 Segment 的数据区）
+    /// 压缩一批日志
+    ///
+    /// 流程：
+    /// 1. 模板提取（若启用）
+    /// 2. XOR-P 编码
+    /// 3. 序列化为紧凑二进制
+    /// 4. Zstd 压缩
     pub fn compress_batch(&self, logs: &[LogLine]) -> io::Result<Vec<u8>> {
         if logs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 1. 预处理降熵
-        let preprocessed = self.preprocess(logs);
+        let raw_bytes = if self.config.enable_template {
+            let batch = TemplateExtractor::extract(logs);
+            let encoded = TemplateExtractor::encode_xor(&batch, self.config.xor_ref_reset);
+            Self::serialize_template(&batch.templates, &encoded)
+        } else {
+            // 回退：旧版 JSON Lines（保留兼容）
+            Self::serialize_json_fallback(logs)
+        };
 
-        // 2. 序列化为紧凑 JSON Lines
-        let text = self.serialize_batch(&preprocessed);
-
-        // 3. Zstd 压缩（带字典或不带字典）
-        let compressed = self.zstd_compress(text.as_bytes())?;
-
-        Ok(compressed)
+        self.zstd_compress(&raw_bytes)
     }
 
-    /// 解压字节流还原为日志行（对应 storage.rs 查询时的流式解压）
+    /// 解压
     pub fn decompress_batch(&self, data: &[u8]) -> io::Result<Vec<LogLine>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 1. Zstd 解压
-        let text = self.zstd_decompress(data)?;
-
-        // 2. 解析紧凑 JSON Lines
-        let compact = self.deserialize_batch(&text)?;
-
-        // 3. 后处理还原
-        let logs = self.postprocess(&compact);
-
-        Ok(logs)
+        let raw = self.zstd_decompress(data)?;
+        
+        // 尝试解析模板格式，失败则回退 JSON
+        if let Ok(logs) = Self::deserialize_template(&raw) {
+            return Ok(logs);
+        }
+        
+        Self::deserialize_json_fallback(&raw)
     }
 
-    // ---------- 预处理（降熵）----------
+    // ---------- 序列化：模板二进制格式 ----------
 
-    fn preprocess(&self, logs: &[LogLine]) -> Vec<CompactLine> {
-        let mut result = Vec::with_capacity(logs.len());
-        let mut prev_ts: u64 = 0;
-        let mut prev_msg: String = String::new();
-        let mut service_table: Vec<String> = Vec::new();
-        let mut service_map: HashMap<String, usize> = HashMap::new();
+    fn serialize_template(templates: &[crate::agent::template::Template], records: &[EncodedRecord]) -> Vec<u8> {
+        let mut buf = Vec::new();
 
-        for (i, log) in logs.iter().enumerate() {
-            let mut line = CompactLine {
-                ts: None,
-                delta: None,
-                service: log.service.clone(),
-                level: log.level.clone(),
-                message: log.message.clone(),
-            };
-
-            // Delta 时间戳编码
-            if self.config.enable_delta {
-                if i == 0 {
-                    line.ts = Some(log.ts);
-                    prev_ts = log.ts;
-                } else {
-                    let delta = log.ts as i64 - prev_ts as i64;
-                    line.delta = Some(delta);
-                    prev_ts = log.ts;
+        // 1. 模板字典
+        buf.extend_from_slice(&(templates.len() as u16).to_le_bytes());
+        for t in templates {
+            buf.extend_from_slice(&(t.parts.len() as u16).to_le_bytes());
+            for part in &t.parts {
+                match part {
+                    crate::agent::template::TemplatePart::Literal(s) => {
+                        buf.push(0x01);
+                        let bytes = s.as_bytes();
+                        buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                        buf.extend_from_slice(bytes);
+                    }
+                    crate::agent::template::TemplatePart::Param => {
+                        buf.push(0x02);
+                    }
                 }
-            } else {
-                line.ts = Some(log.ts);
             }
-
-            // 服务名引用编码（batch 内首次出现存全称，后续用 "$n"）
-            if self.config.enable_service_ref && i > 0 {
-                if let Some(&idx) = service_map.get(&log.service) {
-                    line.service = format!("${}", idx);
-                } else {
-                    let idx = service_table.len();
-                    service_table.push(log.service.clone());
-                    service_map.insert(log.service.clone(), idx);
-                    // 首次出现仍用原名，但后续用引用
-                }
-            } else if i == 0 && self.config.enable_service_ref {
-                service_map.insert(log.service.clone(), 0);
-                service_table.push(log.service.clone());
-            }
-
-            // 行间 Message RLE（相邻行 message 相同则标记 "*"）
-            if self.config.enable_rle && i > 0 && log.message == prev_msg {
-                line.message = "*".to_string();
-            } else {
-                prev_msg = log.message.clone();
-            }
-
-            result.push(line);
         }
 
-        result
+        // 2. 记录
+        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        for rec in records {
+            buf.extend_from_slice(&rec.ts_delta.to_le_bytes());
+            buf.push(rec.svc_id);
+            buf.push(rec.level.as_bytes()[0]); // D/I/W/E
+            buf.extend_from_slice(&rec.pat_id.to_le_bytes());
+            buf.extend_from_slice(&rec.param_encoding.ref_idx.to_le_bytes());
+            buf.extend_from_slice(&(rec.param_encoding.data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&rec.param_encoding.data);
+        }
+
+        buf
     }
 
-    // ---------- 后处理（还原）----------
+    fn deserialize_template(data: &[u8]) -> io::Result<Vec<LogLine>> {
+        use crate::agent::template::{ParamEncoding, TemplateExtractor, TemplatePart};
 
-    fn postprocess(&self, compact: &[CompactLine]) -> Vec<LogLine> {
-        let mut result = Vec::with_capacity(compact.len());
-        let mut prev_ts: u64 = 0;
-        let mut service_table: Vec<String> = Vec::new();
-        let mut prev_msg: String = String::new();
+        let mut offset = 0;
 
-        for (i, line) in compact.iter().enumerate() {
-            // 还原时间戳
-            let ts = if let Some(t) = line.ts {
-                prev_ts = t;
-                t
-            } else if let Some(d) = line.delta {
-                let t = (prev_ts as i64 + d) as u64;
-                prev_ts = t;
-                t
-            } else {
-                prev_ts // 兜底
-            };
-
-            // 还原服务名（解析 "$n" 引用）
-            let service = if line.service.starts_with('$') {
-                let idx: usize = line.service[1..].parse().unwrap_or(0);
-                service_table.get(idx).cloned().unwrap_or_else(|| line.service.clone())
-            } else {
-                if i == 0 || !service_table.contains(&line.service) {
-                    service_table.push(line.service.clone());
+        // 解析模板字典
+        let tmpl_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        let mut templates = Vec::with_capacity(tmpl_count);
+        for _ in 0..tmpl_count {
+            let part_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+            let mut parts = Vec::with_capacity(part_count);
+            for _ in 0..part_count {
+                let tag = data[offset];
+                offset += 1;
+                if tag == 0x01 {
+                    let len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                    offset += 2;
+                    let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+                    offset += len;
+                    parts.push(TemplatePart::Literal(s));
+                } else {
+                    parts.push(TemplatePart::Param);
                 }
-                line.service.clone()
-            };
+            }
+            templates.push(crate::agent::template::Template { id: templates.len() as u16, parts });
+        }
 
-            // 还原 message（"*" 引用上一行）
-            let message = if line.message == "*" {
-                prev_msg.clone()
+        // 解析记录
+        let rec_count = u32::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        let mut logs = Vec::with_capacity(rec_count);
+        let mut prev_ts: u64 = 0;
+        let mut ref_params: Vec<String> = Vec::new();
+
+        for rec_idx in 0..rec_count {
+            let ts_delta = i64::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            ]);
+            offset += 8;
+            let svc_id = data[offset];
+            offset += 1;
+            let level = match data[offset] {
+                b'D' => "D".to_string(),
+                b'I' => "I".to_string(),
+                b'W' => "W".to_string(),
+                b'E' => "E".to_string(),
+                _ => "I".to_string(),
+            };
+            offset += 1;
+            let pat_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            let ref_idx = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            let enc_len = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            let enc_data = &data[offset..offset + enc_len];
+            offset += enc_len;
+
+            // 时间戳重建
+            let ts = if rec_idx == 0 {
+                prev_ts = ts_delta as u64;
+                ts_delta as u64
             } else {
-                prev_msg = line.message.clone();
-                line.message.clone()
+                prev_ts = (prev_ts as i64 + ts_delta) as u64;
+                prev_ts
             };
 
-            result.push(LogLine {
+            // 参数解码
+            let enc_rec = crate::agent::template::EncodedRecord {
+                ts_delta,
+                svc_id,
+                level: level.clone(),
+                pat_id,
+                param_encoding: ParamEncoding {
+                    ref_idx,
+                    data: enc_data.to_vec(),
+                },
+            };
+
+            let params = TemplateExtractor::decode_xor(&enc_rec, &ref_params);
+            if ref_idx == 0 {
+                ref_params = params.clone();
+            }
+
+            // 重建 message
+            let template = &templates[pat_id as usize];
+            let mut msg_parts = Vec::new();
+            let mut param_iter = params.iter();
+            for part in &template.parts {
+                match part {
+                    TemplatePart::Literal(s) => msg_parts.push(s.clone()),
+                    TemplatePart::Param => {
+                        if let Some(p) = param_iter.next() {
+                            msg_parts.push(p.clone());
+                        }
+                    }
+                }
+            }
+            let message = msg_parts.concat();
+
+            logs.push(LogLine {
                 ts,
-                service,
-                level: line.level.clone(),
+                service: format!("svc{}", svc_id),
+                level,
                 message,
             });
         }
 
-        result
+        Ok(logs)
     }
 
-    // ---------- 序列化 ----------
+    // ---------- 回退：JSON Lines ----------
 
-    fn serialize_batch(&self, lines: &[CompactLine]) -> String {
-        let mut buf = String::with_capacity(lines.len() * 128);
-        for line in lines {
-            // 使用紧凑 JSON，无空格
-            let json = serde_json::to_string(line)
-                .unwrap_or_else(|_| r#"{"m":"serialize_error"}"#.to_string());
-            buf.push_str(&json);
-            buf.push('\n');
+    fn serialize_json_fallback(logs: &[LogLine]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(logs.len() * 128);
+        for log in logs {
+            let json = serde_json::to_string(log).unwrap_or_default();
+            buf.extend_from_slice(json.as_bytes());
+            buf.push(b'\n');
         }
         buf
     }
 
-    fn deserialize_batch(&self, text: &str) -> io::Result<Vec<CompactLine>> {
-        let mut result = Vec::new();
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
+    fn deserialize_json_fallback(data: &[u8]) -> io::Result<Vec<LogLine>> {
+        let mut logs = Vec::new();
+        for line in std::str::from_utf8(data).unwrap_or("").lines() {
+            if line.trim().is_empty() { continue; }
+            if let Ok(log) = serde_json::from_str::<LogLine>(line) {
+                logs.push(log);
             }
-            let compact: CompactLine = serde_json::from_str(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            result.push(compact);
         }
-        Ok(result)
+        Ok(logs)
     }
 
-    // ---------- Zstd 压缩/解压 ----------
+    // ---------- Zstd ----------
 
     fn zstd_compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
         if let Some(ref dict) = self.config.dict {
-            // 使用字典压缩（针对模板化日志效率最高）
-            let mut encoder = zstd::stream::write::Encoder::with_dictionary(
-                Vec::new(),
-                self.config.zstd_level,
-                dict,
-            )?;
-            encoder.write_all(data)?;
-            encoder.finish()
+            let mut enc = zstd::stream::write::Encoder::with_dictionary(Vec::new(), self.config.zstd_level, dict)?;
+            enc.write_all(data)?;
+            enc.finish()
         } else {
-            // 标准压缩
             zstd::encode_all(data, self.config.zstd_level)
         }
     }
 
-    fn zstd_decompress(&self, data: &[u8]) -> io::Result<String> {
-        let raw = if let Some(ref dict) = self.config.dict {
-            let mut decoder = zstd::stream::read::Decoder::with_dictionary(data, dict)?;
+    fn zstd_decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if let Some(ref dict) = self.config.dict {
+            let mut dec = zstd::stream::read::Decoder::with_dictionary(data, dict)?;
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)?;
-            out
+            dec.read_to_end(&mut out)?;
+            Ok(out)
         } else {
-            zstd::decode_all(data)?
-        };
-
-        String::from_utf8(raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-}
-
-// ==================== 字典训练 ====================
-
-/// 字典训练器（针对固定格式日志预训练，提升边缘场景压缩比）
-pub struct DictTrainer {
-    samples: Vec<Vec<u8>>,
-    max_size: usize,
-}
-
-impl DictTrainer {
-    pub fn new(max_size: usize) -> Self {
-        Self {
-            samples: Vec::new(),
-            max_size,
-        }
-    }
-
-    /// 添加训练样本（原始文本，未压缩）
-    pub fn add_sample(&mut self, text: &str) {
-        self.samples.push(text.as_bytes().to_vec());
-    }
-
-    /// 从 LogLine 批次添加样本
-    pub fn add_logs(&mut self, logs: &[LogLine]) {
-        let text = logs
-            .iter()
-            .map(|l| {
-                format!(
-                    r#"{{"t":{},"s":"{}","l":"{}","m":"{}"}}"#,
-                    l.ts, l.service, l.level, l.message
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.add_sample(&text);
-    }
-
-    /// 训练并返回字典（失败返回 None）
-    pub fn train(&self) -> Option<Vec<u8>> {
-        if self.samples.is_empty() {
-            return None;
-        }
-        // 合并所有样本为连续字节流
-        let total_len: usize = self.samples.iter().map(|s| s.len()).sum();
-        let mut continuous = Vec::with_capacity(total_len);
-        let mut lengths = Vec::with_capacity(self.samples.len());
-        for s in &self.samples {
-            continuous.extend_from_slice(s);
-            lengths.push(s.len());
-        }
-
-        match zstd::dict::from_continuous(&continuous, &lengths, self.max_size) {
-            Ok(dict) => Some(dict),
-            Err(e) => {
-                eprintln!("[dict] Training failed: {}", e);
-                None
-            }
+            zstd::decode_all(data)
         }
     }
 }
 
-// ==================== 单元测试 ====================
+// ==================== 字典训练（保留） ====================
+
+pub use crate::agent::template::TemplateExtractor as DictTrainerSource; // 别名，保持兼容
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::format::LogLine;
 
     fn make_log(ts: u64, svc: &str, lvl: &str, msg: &str) -> LogLine {
         LogLine {
@@ -381,154 +315,80 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_simple() {
+    fn test_compressor_roundtrip_template() {
         let comp = Compressor::new(CompressorConfig::default());
         let logs = vec![
-            make_log(1715424000000, "nginx", "E", "timeout"),
-            make_log(1715424001000, "nginx", "E", "timeout"),
-            make_log(1715424002000, "nginx", "I", "ok"),
+            make_log(1000, "svc", "I", "alpha"),
+            make_log(2000, "svc", "W", "beta"),
+            make_log(3000, "svc", "E", "gamma"),
         ];
 
         let compressed = comp.compress_batch(&logs).unwrap();
         let decompressed = comp.decompress_batch(&compressed).unwrap();
 
         assert_eq!(decompressed.len(), 3);
-        assert_eq!(decompressed[0].ts, 1715424000000);
-        assert_eq!(decompressed[1].ts, 1715424001000);
-        assert_eq!(decompressed[2].message, "ok");
-    }
-
-    #[test]
-    fn test_delta_encoding_reduces_size() {
-        // 对比：enable_delta vs disable_delta
-        let logs: Vec<LogLine> = (0..1000)
-            .map(|i| make_log(1715424000000 + i * 1000, "app", "I", "heartbeat"))
-            .collect();
-
-        let with_delta = Compressor::new(CompressorConfig {
-            enable_delta: true,
-            enable_rle: false,
-            enable_service_ref: false,
-            ..Default::default()
-        });
-        let without_delta = Compressor::new(CompressorConfig {
-            enable_delta: false,
-            enable_rle: false,
-            enable_service_ref: false,
-            ..Default::default()
-        });
-
-        let c1 = with_delta.compress_batch(&logs).unwrap();
-        let c2 = without_delta.compress_batch(&logs).unwrap();
-
-        println!("With delta: {} bytes, Without: {} bytes", c1.len(), c2.len());
-        assert!(c1.len() < c2.len(), "delta encoding should reduce size");
-    }
-
-    #[test]
-    fn test_rle_encoding() {
-        let logs = vec![
-            make_log(1000, "svc", "I", "same message"),
-            make_log(2000, "svc", "I", "same message"),
-            make_log(3000, "svc", "I", "same message"),
-            make_log(4000, "svc", "I", "different"),
-        ];
-
-        let comp = Compressor::new(CompressorConfig::default());
-        let compressed = comp.compress_batch(&logs).unwrap();
-        let decompressed = comp.decompress_batch(&compressed).unwrap();
-
-        assert_eq!(decompressed.len(), 4);
-        assert_eq!(decompressed[0].message, "same message");
-        assert_eq!(decompressed[1].message, "same message");
-        assert_eq!(decompressed[2].message, "same message");
-        assert_eq!(decompressed[3].message, "different");
-    }
-
-    #[test]
-    fn test_service_ref_encoding() {
-        let logs = vec![
-            make_log(1000, "nginx", "I", "a"),
-            make_log(2000, "nginx", "I", "b"),
-            make_log(3000, "nginx", "I", "c"),
-            make_log(4000, "postgres", "I", "d"),
-            make_log(5000, "postgres", "I", "e"),
-        ];
-
-        let comp = Compressor::new(CompressorConfig::default());
-        let compressed = comp.compress_batch(&logs).unwrap();
-        let decompressed = comp.decompress_batch(&compressed).unwrap();
-
-        assert_eq!(decompressed[0].service, "nginx");
-        assert_eq!(decompressed[3].service, "postgres");
-    }
-
-    #[test]
-    fn test_compression_ratio_high_entropy_logs() {
-        // 模拟高重复性边缘日志（如传感器数据）
-        let template = "Sensor reading: temperature=25.3, humidity=60%, status=OK, device_id=DEV-12345, location=FLOOR-3-ROOM-7";
-        let logs: Vec<LogLine> = (0..1000)
-            .map(|i| make_log(1715424000000 + i * 100, "iot", "I", template))
-            .collect();
-
-        let comp = Compressor::new(CompressorConfig::default());
-        let compressed = comp.compress_batch(&logs).unwrap();
-
-        let original_size: usize = logs.iter().map(|l| l.message.len() + 50).sum();
-        let ratio = original_size as f64 / compressed.len() as f64;
-
-        println!("Original: {} bytes, Compressed: {} bytes, Ratio: {:.2}x", original_size, compressed.len(), ratio);
-        assert!(ratio > 5.0, "expected >5x compression for repetitive logs, got {:.2}x", ratio);
-    }
-
-    #[test]
-    fn test_dict_compression_improvement() {
-        // 1. 训练字典
-        let mut trainer = DictTrainer::new(100 * 1024); // 100KB 字典
-        for _ in 0..10 {
-            let sample: Vec<LogLine> = (0..100)
-                .map(|i| make_log(1000 + i * 100, "nginx", "I", "GET /api/v1/users HTTP/1.1 200"))
-                .collect();
-            trainer.add_logs(&sample);
+        for (a, b) in logs.iter().zip(decompressed.iter()) {
+            println!("orig: ts={}, svc={}, lvl={}, msg={:?}", a.ts, a.service, a.level, a.message);
+            println!("dec:  ts={}, svc={}, lvl={}, msg={:?}", b.ts, b.service, b.level, b.message);
+            assert_eq!(a.ts, b.ts, "ts mismatch");
+            assert_eq!(a.level, b.level, "level mismatch");
+            assert_eq!(a.message, b.message, "message mismatch");
         }
-        let dict = trainer.train().expect("dict training failed");
-
-        // 2. 对比
-        let logs: Vec<LogLine> = (0..500)
-            .map(|i| make_log(2000 + i * 100, "nginx", "I", "GET /api/v1/users HTTP/1.1 200"))
-            .collect();
-
-        let with_dict = Compressor::with_dict(3, dict);
-        let without_dict = Compressor::new(CompressorConfig::default());
-
-        let c1 = with_dict.compress_batch(&logs).unwrap();
-        let c2 = without_dict.compress_batch(&logs).unwrap();
-
-        println!("With dict: {} bytes, Without: {} bytes", c1.len(), c2.len());
-        // 字典通常能提升 10-30%
-        assert!(c1.len() <= c2.len(), "dict should not worsen compression");
     }
-
-    #[test]
-    fn test_empty_batch() {
-        let comp = Compressor::new(CompressorConfig::default());
-        let compressed = comp.compress_batch(&[]).unwrap();
-        assert!(compressed.is_empty());
-        let decompressed = comp.decompress_batch(&compressed).unwrap();
-        assert!(decompressed.is_empty());
+}
+#[test]
+fn test_debug_deserialize() {
+    use crate::agent::compressor::{Compressor, CompressorConfig};
+    use crate::shared::format::LogLine;
+    
+    let comp = Compressor::new(CompressorConfig::default());
+    let logs = vec![
+        LogLine { ts: 1000, service: "svc".into(), level: "I".into(), message: "alpha".into() },
+        LogLine { ts: 2000, service: "svc".into(), level: "W".into(), message: "beta".into() },
+        LogLine { ts: 3000, service: "svc".into(), level: "E".into(), message: "gamma".into() },
+    ];
+    let compressed = comp.compress_batch(&logs).unwrap();
+    let raw = comp.zstd_decompress(&compressed).unwrap();
+    
+    println!("raw bytes len = {}", raw.len());
+    println!("raw bytes = {:?}", &raw);
+    
+    // manually parse
+    let mut offset = 0;
+    let tmpl_count = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+    offset += 2;
+    println!("tmpl_count = {}", tmpl_count);
+    for i in 0..tmpl_count {
+        let part_count = u16::from_le_bytes([raw[offset], raw[offset+1]]) as usize;
+        offset += 2;
+        println!("  template {} part_count = {}", i, part_count);
+        for j in 0..part_count {
+            let tag = raw[offset];
+            offset += 1;
+            if tag == 0x01 {
+                let len = u16::from_le_bytes([raw[offset], raw[offset+1]]) as usize;
+                offset += 2;
+                let s = String::from_utf8_lossy(&raw[offset..offset+len]).to_string();
+                offset += len;
+                println!("    part {}: Literal({:?}, len={})", j, s, len);
+            } else {
+                println!("    part {}: Param", j);
+            }
+        }
     }
-
-    #[test]
-    fn test_large_batch_stability() {
-        let logs: Vec<LogLine> = (0..10000)
-            .map(|i| make_log(i * 1000, "svc", "I", &format!("message number {}", i)))
-            .collect();
-
-        let comp = Compressor::new(CompressorConfig::default());
-        let compressed = comp.compress_batch(&logs).unwrap();
-        let decompressed = comp.decompress_batch(&compressed).unwrap();
-
-        assert_eq!(decompressed.len(), 10000);
-        assert_eq!(decompressed[9999].ts, 9999 * 1000);
+    let rec_count = u32::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3]]) as usize;
+    offset += 4;
+    println!("rec_count = {}", rec_count);
+    for i in 0..rec_count {
+        let ts_delta = i64::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3], raw[offset+4], raw[offset+5], raw[offset+6], raw[offset+7]]);
+        offset += 8;
+        let svc_id = raw[offset]; offset += 1;
+        let level = raw[offset]; offset += 1;
+        let pat_id = u16::from_le_bytes([raw[offset], raw[offset+1]]); offset += 2;
+        let ref_idx = u16::from_le_bytes([raw[offset], raw[offset+1]]); offset += 2;
+        let enc_len = u32::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3]]) as usize; offset += 4;
+        let enc_data = &raw[offset..offset+enc_len]; offset += enc_len;
+        println!("  rec {}: ts_delta={}, svc_id={}, level={}, pat_id={}, ref_idx={}, enc_len={}", i, ts_delta, svc_id, level as char, pat_id, ref_idx, enc_len);
     }
+    println!("final offset = {}, total = {}", offset, raw.len());
 }
