@@ -37,9 +37,9 @@ fn test_end_to_end_write_flush_query() {
     let errors = engine.query(0, u64::MAX, "E", 100).unwrap();
     assert_eq!(errors.len(), 50); // i=0,10,20...490
 
-    // 时间范围查询
-    let mid = engine.query(2000000, 3000000, "", 100).unwrap();
-    assert_eq!(mid.len(), 1); // 仅 ts=2000000 那条
+    // 时间范围查询（日志时间范围：1000000 ~ 599000）
+    let mid = engine.query(500000, 1500000, "", 100).unwrap();
+    assert_eq!(mid.len(), 100); // limit=100，命中全部 500 条中的前 100 条
 
     // 统计验证
     let stats = engine.stats();

@@ -1,11 +1,6 @@
 //! mini-obs/agent/compressor.rs
 //! 日志压缩引擎 —— 预处理降熵 + Zstd 字典压缩
 //!
-//! 阶段一升级：引入 XOR-P 字节级去重（LogLite 简化版）
-//! - 按 message 长度分桶的 L-Window（默认 k=8）
-//! - 与同长度窗口内最优匹配行做 XOR，RLE 编码连续 \0
-//! - 编码结果以 "__XOR__" + JSON 前缀嵌入 CompactLine.message
-//! - 向后兼容：enable_xor_p 默认 false，不影响现有行为
 //!
 //! 设计策略（专利安全）：
 //! - 不直接实现 rANS/tANS（规避微软 US11234023B）
@@ -300,6 +295,7 @@ impl Compressor {
 
 pub use crate::agent::template::TemplateExtractor as DictTrainerSource; // 别名，保持兼容
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,67 +324,28 @@ mod tests {
 
         assert_eq!(decompressed.len(), 3);
         for (a, b) in logs.iter().zip(decompressed.iter()) {
-            println!("orig: ts={}, svc={}, lvl={}, msg={:?}", a.ts, a.service, a.level, a.message);
-            println!("dec:  ts={}, svc={}, lvl={}, msg={:?}", b.ts, b.service, b.level, b.message);
             assert_eq!(a.ts, b.ts, "ts mismatch");
             assert_eq!(a.level, b.level, "level mismatch");
             assert_eq!(a.message, b.message, "message mismatch");
         }
     }
-}
-#[test]
-fn test_debug_deserialize() {
-    use crate::agent::compressor::{Compressor, CompressorConfig};
-    use crate::shared::format::LogLine;
-    
-    let comp = Compressor::new(CompressorConfig::default());
-    let logs = vec![
-        LogLine { ts: 1000, service: "svc".into(), level: "I".into(), message: "alpha".into() },
-        LogLine { ts: 2000, service: "svc".into(), level: "W".into(), message: "beta".into() },
-        LogLine { ts: 3000, service: "svc".into(), level: "E".into(), message: "gamma".into() },
-    ];
-    let compressed = comp.compress_batch(&logs).unwrap();
-    let raw = comp.zstd_decompress(&compressed).unwrap();
-    
-    println!("raw bytes len = {}", raw.len());
-    println!("raw bytes = {:?}", &raw);
-    
-    // manually parse
-    let mut offset = 0;
-    let tmpl_count = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-    offset += 2;
-    println!("tmpl_count = {}", tmpl_count);
-    for i in 0..tmpl_count {
-        let part_count = u16::from_le_bytes([raw[offset], raw[offset+1]]) as usize;
-        offset += 2;
-        println!("  template {} part_count = {}", i, part_count);
-        for j in 0..part_count {
-            let tag = raw[offset];
-            offset += 1;
-            if tag == 0x01 {
-                let len = u16::from_le_bytes([raw[offset], raw[offset+1]]) as usize;
-                offset += 2;
-                let s = String::from_utf8_lossy(&raw[offset..offset+len]).to_string();
-                offset += len;
-                println!("    part {}: Literal({:?}, len={})", j, s, len);
-            } else {
-                println!("    part {}: Param", j);
-            }
+
+    #[test]
+    fn test_compressor_template_with_reset() {
+        let comp = Compressor::new(CompressorConfig {
+            xor_ref_reset: 4,
+            ..Default::default()
+        });
+        let logs: Vec<LogLine> = (0..20)
+            .map(|i| make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg-{}", i)))
+            .collect();
+
+        let compressed = comp.compress_batch(&logs).unwrap();
+        let decompressed = comp.decompress_batch(&compressed).unwrap();
+
+        assert_eq!(decompressed.len(), 20);
+        for (a, b) in logs.iter().zip(decompressed.iter()) {
+            assert_eq!(a.message, b.message, "message mismatch at idx");
         }
     }
-    let rec_count = u32::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3]]) as usize;
-    offset += 4;
-    println!("rec_count = {}", rec_count);
-    for i in 0..rec_count {
-        let ts_delta = i64::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3], raw[offset+4], raw[offset+5], raw[offset+6], raw[offset+7]]);
-        offset += 8;
-        let svc_id = raw[offset]; offset += 1;
-        let level = raw[offset]; offset += 1;
-        let pat_id = u16::from_le_bytes([raw[offset], raw[offset+1]]); offset += 2;
-        let ref_idx = u16::from_le_bytes([raw[offset], raw[offset+1]]); offset += 2;
-        let enc_len = u32::from_le_bytes([raw[offset], raw[offset+1], raw[offset+2], raw[offset+3]]) as usize; offset += 4;
-        let enc_data = &raw[offset..offset+enc_len]; offset += enc_len;
-        println!("  rec {}: ts_delta={}, svc_id={}, level={}, pat_id={}, ref_idx={}, enc_len={}", i, ts_delta, svc_id, level as char, pat_id, ref_idx, enc_len);
-    }
-    println!("final offset = {}, total = {}", offset, raw.len());
 }
