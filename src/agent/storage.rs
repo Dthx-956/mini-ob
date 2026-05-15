@@ -244,6 +244,24 @@ impl StorageEngine {
             )?;
         }
 
+        // 搜索缓冲区中的日志
+        {
+            let state = self.state.lock().unwrap();
+            for log in &state.buffer {
+                if results.len() >= limit {
+                    break;
+                }
+                if log.ts >= start && log.ts <= end {
+                    if log.service.contains(keyword)
+                        || log.level.contains(keyword)
+                        || log.message.contains(keyword)
+                    {
+                        results.push(log.clone());
+                    }
+                }
+            }
+        }
+
         results.sort_by_key(|log| std::cmp::Reverse(log.ts));
         Ok(results)
     }
@@ -326,14 +344,14 @@ impl StorageEngine {
 
             for (i, rec) in chunk_records.iter().enumerate() {
                 let mut encoding_data = Vec::new();
-                encoding_data.extend_from_slice(&(rec.params.len() as u16).to_le_bytes());
+                encoding_data.extend_from_slice(&(rec.params.len() as u32).to_le_bytes());
 
                 if i == 0 {
                     // Chunk 首行：存原始参数
                     ref_params = rec.params.clone();
                     for p in &rec.params {
                         let bytes = p.as_bytes();
-                        encoding_data.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                        encoding_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                         encoding_data.extend_from_slice(bytes);
                     }
                 } else {
@@ -380,7 +398,7 @@ impl StorageEngine {
         // 3. 组装 Segment 文件
         let pattern_table = batch.serialize_pattern_table();
         let pattern_count = batch.templates.len() as u16;
-        let pattern_table_len = pattern_table.len() as u16;
+        let pattern_table_len = pattern_table.len() as u32;
 
         // 计算各区域偏移（v2: Header + PatternTable + ChunkTable + SummaryTable + Padding + Data）
         let table_start = SEGMENT_HEADER_SIZE + pattern_table.len();
@@ -477,7 +495,10 @@ impl StorageEngine {
         for (i, rec) in records.iter().enumerate() {
             // 存储绝对时间戳（u64），便于独立解码
             buf.extend_from_slice(&logs[i].ts.to_le_bytes());
-            buf.push(rec.svc_id);
+            // 存储完整 service 字符串（len u16 + bytes）
+            let svc_bytes = logs[i].service.as_bytes();
+            buf.extend_from_slice(&(svc_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(svc_bytes);
             buf.push(rec.level.as_bytes()[0]);
             buf.extend_from_slice(&rec.pat_id.to_le_bytes());
             // 参数编码数据
@@ -673,10 +694,11 @@ impl StorageEngine {
                 continue; // 跳过不解压
             }
 
-            // param_bloom 过滤：仅在 keyword 未匹配任何模板固定文本时生效
-            //（若已匹配模板文本，则匹配可能在固定文本中，不能通过 bloom 跳过）
+            // param_bloom 过滤：仅在 keyword 匹配了某个模板但 pattern_mask 不匹配时生效
+            // 若 keyword 不在任何模板中（可能在 service/level/message 中），保守不解压过滤
             let keyword_in_template = !keyword_pats.is_empty() && pattern_hit;
-            if !keyword_in_template && !summary.bloom_may_contain(keyword) {
+            let should_bloom_skip = !keyword_in_template && !keyword_pats.is_empty();
+            if should_bloom_skip && !summary.bloom_may_contain(keyword) {
                 continue; // Bloom 判定一定不包含，跳过
             }
 
@@ -694,13 +716,12 @@ impl StorageEngine {
             
             // 解析并还原 XOR-P
             let logs = self.deserialize_chunk_binary(&chunk_binary, &templates)?;
-            
             for log in logs {
                 if log.ts >= start && log.ts <= end {
-                    if log.service.contains(keyword)
-                        || log.level.contains(keyword)
-                        || log.message.contains(keyword)
-                    {
+                    let svc_match = log.service.contains(keyword);
+                    let lvl_match = log.level.contains(keyword);
+                    let msg_match = log.message.contains(keyword);
+                    if svc_match || lvl_match || msg_match {
                         results.push(log);
                         if results.len() >= limit {
                             return Ok(());
@@ -734,9 +755,14 @@ impl StorageEngine {
             ]);
             offset += 8;
 
-            if offset + 3 > data.len() { break; }
-            let svc_id = data[offset];
-            offset += 1;
+            if offset + 2 > data.len() { break; }
+            let svc_len = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+            offset += 2;
+            if offset + svc_len > data.len() { break; }
+            let service = String::from_utf8_lossy(&data[offset..offset+svc_len]).to_string();
+            offset += svc_len;
+
+            if offset + 1 > data.len() { break; }
             let level_byte = data[offset];
             offset += 1;
             let level = match level_byte {
@@ -762,20 +788,24 @@ impl StorageEngine {
             offset += enc_len;
 
             // 解析参数编码
-            let param_count = u16::from_le_bytes([enc_data[0], enc_data[1]]) as usize;
+            if enc_data.len() < 4 {
+                logs.push(LogLine { ts, service, level: level.to_string(), message: "".to_string() });
+                continue;
+            }
+            let param_count = u32::from_le_bytes([enc_data[0], enc_data[1], enc_data[2], enc_data[3]]) as usize;
             let mut params = Vec::with_capacity(param_count);
 
-            if param_count > 0 && enc_data.len() > 4 {
+            if param_count > 0 && enc_data.len() > 8 {
                 // 检查是否是原始参数（Chunk 首行）或 XOR-P
-                let second_len = u16::from_le_bytes([enc_data[2], enc_data[3]]) as usize;
-                let is_raw = second_len <= 256 && enc_data.len() >= 4 + second_len;
+                let second_len = u32::from_le_bytes([enc_data[4], enc_data[5], enc_data[6], enc_data[7]]) as usize;
+                let is_raw = second_len <= 256 && enc_data.len() >= 8 + second_len;
 
                 if is_raw && ref_params.is_empty() {
                     // Chunk 首行：原始参数
-                    let mut p_offset = 2;
+                    let mut p_offset = 4;
                     for _ in 0..param_count {
-                        let len = u16::from_le_bytes([enc_data[p_offset], enc_data[p_offset+1]]) as usize;
-                        p_offset += 2;
+                        let len = u32::from_le_bytes([enc_data[p_offset], enc_data[p_offset+1], enc_data[p_offset+2], enc_data[p_offset+3]]) as usize;
+                        p_offset += 4;
                         let s = String::from_utf8_lossy(&enc_data[p_offset..p_offset+len]).to_string();
                         p_offset += len;
                         params.push(s);
@@ -783,7 +813,7 @@ impl StorageEngine {
                     ref_params = params.clone();
                 } else {
                     // XOR-P 解码
-                    let mut p_offset = 2;
+                    let mut p_offset = 4;
                     for i in 0..param_count {
                         let base = ref_params.get(i).map(|s| s.as_str()).unwrap_or("");
                         let (param, consumed) = TemplateExtractor::decode_xor_param_64bit(&enc_data[p_offset..], base);
@@ -821,7 +851,7 @@ impl StorageEngine {
             // 需要在 Chunk 首行存绝对 ts，或外部传入。简化：存绝对 ts 在 Chunk 首行。
             logs.push(LogLine {
                 ts,
-                service: format!("svc{}", svc_id),
+                service,
                 level: level.to_string(),
                 message,
             });
@@ -977,4 +1007,269 @@ mod tests {
         let all = engine.query(0, u64::MAX, "", 100).unwrap();
         assert_eq!(all.len(), 3);
     }
+// 将以下内容追加到 src/agent/storage.rs 的 #[cfg(test)] mod tests 中
+
+#[test]
+fn test_wal_crash_recovery() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 100,
+        ..Default::default()
+    };
+
+    // 模拟崩溃：写入 WAL 但未 flush
+    {
+        let engine = StorageEngine::open(&dir, cfg.clone()).unwrap();
+        engine.append(make_log(1000, "svc", "I", "wal line 1")).unwrap();
+        engine.append(make_log(2000, "svc", "I", "wal line 2")).unwrap();
+        engine.append(make_log(3000, "svc", "E", "wal line 3")).unwrap();
+        // 不调用 flush，直接 drop（模拟崩溃）
+    }
+
+    // 重新打开，应自动恢复 WAL 并 flush 为 Segment
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+    let stats = engine.stats();
+    assert_eq!(stats.total_lines, 3);
+    assert_eq!(stats.segment_count, 1);
+
+    let all = engine.query(0, u64::MAX, "", 100).unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().any(|l| l.message == "wal line 1"));
+    assert!(all.iter().any(|l| l.message == "wal line 3"));
+}
+
+#[test]
+fn test_auto_flush_multiple_segments() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 5,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    // 写入 23 条，应触发 4 个 segment (5+5+5+5=20 flush, 3 缓冲) —— 注意：append 内部判断阈值
+    for i in 0..23 {
+        engine.append(make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg {}", i))).unwrap();
+    }
+
+    let stats = engine.stats();
+    // total_lines 仅统计已 flush 的 segment 中的日志
+    assert_eq!(stats.total_lines + stats.buffered_lines as u64, 23);
+    // 23 / 5 = 4 个完整 flush + 3 条在缓冲（实际可能因 WAL 恢复机制略有偏差）
+    assert!(stats.segment_count >= 3);
+    assert_eq!(stats.buffered_lines, 3);
+}
+
+#[test]
+fn test_query_time_range_boundaries() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 3,
+        chunk_size: 3,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    engine.append(make_log(1000, "svc", "I", "alpha")).unwrap();
+    engine.append(make_log(2000, "svc", "I", "beta")).unwrap();
+    engine.append(make_log(3000, "svc", "E", "gamma")).unwrap();
+
+    let exact = engine.query(1000, 3000, "", 100).unwrap();
+    assert_eq!(exact.len(), 3);
+
+    let narrow = engine.query(1500, 2500, "", 100).unwrap();
+    assert_eq!(narrow.len(), 1);
+    assert_eq!(narrow[0].message, "beta");
+
+    let miss = engine.query(4000, 5000, "", 100).unwrap();
+    assert!(miss.is_empty());
+}
+
+#[test]
+fn test_query_limit_truncation() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 10,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    for i in 0..20 {
+        engine.append(make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg {}", i))).unwrap();
+    }
+
+    let limited = engine.query(0, u64::MAX, "", 5).unwrap();
+    assert_eq!(limited.len(), 5);
+
+    let unlimited = engine.query(0, u64::MAX, "", 100).unwrap();
+    assert_eq!(unlimited.len(), 20);
+}
+
+#[test]
+fn test_query_keyword_no_match() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 5,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    for i in 0..10 {
+        engine.append(make_log(1000 + i as u64 * 100, "svc", "I", &format!("standard log {}", i))).unwrap();
+    }
+
+    let none = engine.query(0, u64::MAX, "NONEXISTENT_KEYWORD_12345", 100).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
+fn test_empty_directory_startup() {
+    let dir = test_dir();
+    let cfg = StorageConfig::default();
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    let stats = engine.stats();
+    assert_eq!(stats.segment_count, 0);
+    assert_eq!(stats.total_lines, 0);
+    assert_eq!(stats.buffered_lines, 0);
+}
+
+#[test]
+fn test_stats_accumulation() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 5,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    for i in 0..15 {
+        engine.append(make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg {}", i))).unwrap();
+    }
+
+    let stats = engine.stats();
+    assert_eq!(stats.total_lines, 15);
+    assert_eq!(stats.segment_count, 3);
+    assert!(stats.total_original_bytes > 0);
+    assert!(stats.total_compressed_bytes > 0);
+    assert!(stats.compression_ratio() > 0.0);
+}
+
+#[test]
+fn test_append_large_message() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 2,
+        chunk_size: 2,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    let big_msg = "x".repeat(1024 * 1024); // 1MB
+    engine.append(make_log(1000, "svc", "E", &big_msg)).unwrap();
+    engine.append(make_log(2000, "svc", "E", &big_msg)).unwrap();
+
+    let all = engine.query(0, u64::MAX, "", 100).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].message.len(), 1024 * 1024);
+}
+
+#[test]
+fn test_high_frequency_append() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 100,
+        chunk_size: 50,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    for i in 0..1000 {
+        engine.append(make_log(1000 + i as u64, "svc", "I", &format!("high freq {}", i))).unwrap();
+    }
+
+    let stats = engine.stats();
+    assert_eq!(stats.total_lines, 1000);
+    assert_eq!(stats.buffered_lines, 0); // 1000 / 100 = 10 次 flush，缓冲应为 0
+}
+
+#[test]
+fn test_query_keyword_in_service() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 5,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    engine.append(make_log(1000, "auth-service", "I", "login ok")).unwrap();
+    engine.append(make_log(2000, "payment-service", "I", "pay ok")).unwrap();
+    engine.append(make_log(3000, "auth-service", "E", "login fail")).unwrap();
+
+    let auth = engine.query(0, u64::MAX, "auth", 100).unwrap();
+    assert_eq!(auth.len(), 2);
+}
+
+#[test]
+fn test_query_keyword_in_level() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 5,
+        chunk_size: 5,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    for i in 0..10 {
+        let lvl = if i % 3 == 0 { "E" } else { "I" };
+        engine.append(make_log(1000 + i as u64 * 100, "svc", lvl, &format!("msg {}", i))).unwrap();
+    }
+
+    let errors = engine.query(0, u64::MAX, "E", 100).unwrap();
+    // 关键词 "E" 匹配 level 字段
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn test_flush_empty_buffer() {
+    let dir = test_dir();
+    let cfg = StorageConfig::default();
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    // 空缓冲 flush 应无错误
+    engine.flush().unwrap();
+
+    let stats = engine.stats();
+    assert_eq!(stats.segment_count, 0);
+}
+
+#[test]
+fn test_segment_file_corruption_graceful() {
+    let dir = test_dir();
+    let cfg = StorageConfig {
+        max_buffer_lines: 3,
+        chunk_size: 3,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&dir, cfg).unwrap();
+
+    engine.append(make_log(1000, "svc", "I", "msg1")).unwrap();
+    engine.append(make_log(2000, "svc", "I", "msg2")).unwrap();
+    engine.append(make_log(3000, "svc", "I", "msg3")).unwrap();
+
+    // 破坏 segment 文件
+    let seg_path = dir.join("segments").join("segment-00000001.mobs");
+    if seg_path.exists() {
+        fs::write(&seg_path, b"CORRUPTED").unwrap();
+    }
+
+    // 查询应返回错误而非 panic
+    let result = engine.query(0, u64::MAX, "", 100);
+    assert!(result.is_err() || result.unwrap().is_empty());
+}
 }

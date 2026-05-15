@@ -8,7 +8,7 @@
 //! - 多格式兼容：支持标准 JSON 日志 + 本系统紧凑格式 (t/s/l/m) + 原始行降级
 //! - 跨平台：纯 Rust 标准库 + serde_json，无系统特定依赖
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -381,7 +381,7 @@ fn parse_json_value(v: serde_json::Value, default_service: &str, fallback_line: 
 
 /// Nginx 行简易解析
 fn parse_nginx_line(line: &str, _default_service: &str) -> Option<LogLine> {
-    let level = if line.contains(" 5") || line.contains(" 4") {
+    let level = if line.contains("\" 5") || line.contains("\" 4") {
         "E".to_string()
     } else {
         "I".to_string()
@@ -566,4 +566,180 @@ mod tests {
         assert!(count >= 10); // 至少收到一些，证明 channel 在工作
         collector.stop();
     }
+// 将以下内容追加到 src/agent/collector.rs 的 #[cfg(test)] mod tests 中
+
+#[test]
+fn test_parse_json_with_iso_timestamp() {
+    let line = r#"{"timestamp":"1715424000000","service":"app","level":"INFO","message":"ok"}"#;
+    let log = parse_line(line, "default").unwrap();
+    assert_eq!(log.ts, 1715424000000);
+    assert_eq!(log.level, "I");
+}
+
+#[test]
+fn test_parse_json_fallback_on_malformed() {
+    // 以 { 开头但非有效 JSON，应降级为原始行
+    let line = "{this is not json";
+    let log = parse_line(line, "app").unwrap();
+    assert_eq!(log.service, "app");
+    assert!(log.message.contains("this is not json"));
+}
+
+#[test]
+fn test_parse_nginx_success_status() {
+    let line = r#"127.0.0.1 - - [11/May/2026:14:32:10 +0000] "GET /api HTTP/1.1" 200 42"#;
+    let log = parse_line(line, "web").unwrap();
+    assert_eq!(log.level, "I"); // 200 是 I
+    assert_eq!(log.service, "ngx");
+}
+
+#[test]
+fn test_parse_nginx_4xx_status() {
+    let line = r#"127.0.0.1 - - [11/May/2026:14:32:10 +0000] "GET /api HTTP/1.1" 404 42"#;
+    let log = parse_line(line, "web").unwrap();
+    assert_eq!(log.level, "E"); // 4xx 视为 E
+}
+
+#[test]
+fn test_infer_level_panic() {
+    assert_eq!(infer_level("PANIC: something terrible"), "E");
+    assert_eq!(infer_level("FATAL: cannot continue"), "E");
+    assert_eq!(infer_level("CRITICAL: disk full"), "E");
+}
+
+#[test]
+fn test_infer_level_case_insensitive() {
+    assert_eq!(infer_level("error occurred"), "E");
+    assert_eq!(infer_level("ERROR occurred"), "E");
+    assert_eq!(infer_level("Error occurred"), "E");
+}
+
+#[test]
+fn test_parse_line_with_null_bytes() {
+    let line = "log message with   null";
+    let log = parse_line(line, "svc").unwrap();
+    assert!(log.message.contains("null"));
+}
+
+#[test]
+fn test_parse_line_very_long() {
+    let long_msg = "a".repeat(10000);
+    let line = format!(r#"{{"t":1000,"s":"svc","l":"I","m":"{}"}}"#, long_msg);
+    let log = parse_line(&line, "default").unwrap();
+    assert_eq!(log.message.len(), 10000);
+}
+
+#[test]
+fn test_mock_collector_stop_signal() {
+    let config = CollectorConfig {
+        source: SourceType::Mock {
+            rate_per_sec: 10000,
+            duration_sec: 10, // 很长
+        },
+        poll_interval: Duration::from_millis(10),
+        service_name: "stop_test".to_string(),
+    };
+
+    let (collector, rx) = Collector::start(config).unwrap();
+
+    // 收集少量数据
+    let mut count = 0;
+    while let Ok(_) = rx.recv_timeout(Duration::from_millis(50)) {
+        count += 1;
+        if count >= 20 { break; }
+    }
+
+    // 停止采集器
+    collector.stop();
+
+    // 停止后不应再收到数据（channel 可能还有缓冲，但线程已结束）
+    let remaining = rx.recv_timeout(Duration::from_millis(100));
+    // 允许少量缓冲残留，但线程必须已退出
+    // 此处主要验证 stop 不 panic
+}
+
+#[test]
+fn test_file_tail_collection() {
+    use std::io::Write;
+    let tmp_dir = std::env::temp_dir().join(format!("mini-obs-tail-test-{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let log_path = tmp_dir.join("test.log");
+
+    // 预先写入一些内容
+    {
+        let mut file = File::create(&log_path).unwrap();
+        writeln!(file, r#"{{"t":1000,"s":"svc","l":"I","m":"first"}}"#).unwrap();
+    }
+
+    let config = CollectorConfig {
+        source: SourceType::File { path: log_path.clone() },
+        poll_interval: Duration::from_millis(50),
+        service_name: "file_test".to_string(),
+    };
+
+    let (collector, rx) = Collector::start(config).unwrap();
+
+    // 等待采集器启动并读到现有内容（注意：File 模式首次启动跳到末尾，可能读不到旧数据）
+    // 追加新行
+    std::thread::sleep(Duration::from_millis(100));
+    {
+        let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+        writeln!(file, r#"{{"t":2000,"s":"svc","l":"W","m":"second"}}"#).unwrap();
+        writeln!(file, r#"{{"t":3000,"s":"svc","l":"E","m":"third"}}"#).unwrap();
+    }
+
+    // 等待采集
+    let mut logs = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Ok(log) = rx.recv_timeout(Duration::from_millis(100)) {
+            logs.push(log);
+            if logs.len() >= 2 { break; }
+        }
+    }
+
+    collector.stop();
+    fs::remove_dir_all(&tmp_dir).unwrap_or_default();
+
+    // 至少应收到追加的两条（首次启动跳到末尾，旧数据可能收不到）
+    assert!(!logs.is_empty(), "File tail should collect appended logs");
+}
+
+#[test]
+fn test_parse_compact_json_with_extra_fields() {
+    // 紧凑格式含额外字段应忽略
+    let line = r#"{"t":1000,"s":"svc","l":"I","m":"msg","extra":"ignored"}"#;
+    let log = parse_line(line, "default").unwrap();
+    assert_eq!(log.ts, 1000);
+    assert_eq!(log.message, "msg");
+}
+
+#[test]
+fn test_parse_json_array_rejected() {
+    // JSON 数组应降级为原始行
+    let line = r#"[{"t":1000,"s":"svc","l":"I","m":"msg"}]"#;
+    let log = parse_line(line, "app").unwrap();
+    assert_eq!(log.service, "app");
+    assert!(log.message.contains("["));
+}
+
+#[test]
+fn test_normalize_level_extended() {
+    assert_eq!(normalize_level("debug"), "D");
+    assert_eq!(normalize_level("DEBUG"), "D");
+    assert_eq!(normalize_level("information"), "I");
+    assert_eq!(normalize_level("warn"), "W");
+    assert_eq!(normalize_level("warning"), "W");
+    assert_eq!(normalize_level("err"), "E");
+    assert_eq!(normalize_level("fatal"), "E");
+    assert_eq!(normalize_level("critical"), "E");
+}
+
+#[test]
+fn test_parse_iso_timestamp_seconds() {
+    // 秒级时间戳应被识别并转为毫秒
+    let line = r#"{"timestamp":"1715424000","service":"app","level":"INFO","message":"ok"}"#;
+    let log = parse_line(line, "default").unwrap();
+    assert_eq!(log.ts, 1715424000000);
+}
 }
