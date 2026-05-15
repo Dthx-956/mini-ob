@@ -121,6 +121,7 @@ impl StorageEngine {
             ..Default::default()
         });
 
+        let seg_dir = data_dir.join("segments");
         let wal_path = data_dir.join("wal").join("current.wal");
         let wal_file = OpenOptions::new()
             .create(true)
@@ -140,6 +141,19 @@ impl StorageEngine {
             total_original: AtomicU64::new(0),
             total_compressed: AtomicU64::new(0),
         };
+
+        // 重建已有 segment 的 size 统计（进程重启后 AtomicU64 归零）
+        if let Ok(entries) = fs::read_dir(&seg_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("mobs") {
+                    if let Ok((orig, comp)) = Self::read_segment_size_stats(&path) {
+                        engine.total_original.fetch_add(orig, Ordering::Relaxed);
+                        engine.total_compressed.fetch_add(comp, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
 
         let recovered = Self::read_wal(&wal_path)?;
         if !recovered.is_empty() {
@@ -279,6 +293,31 @@ impl StorageEngine {
             total_compressed_bytes: self.total_compressed.load(Ordering::Relaxed),
         }
     }
+
+/// 从已有 Segment 文件中读取所有 Chunk 的 original/compressed 大小
+fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
+    let file = File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    if mmap.len() < SEGMENT_HEADER_SIZE + SEGMENT_FOOTER_SIZE {
+        return Ok((0, 0));
+    }
+    let header = SegmentHeader::from_bytes(&mmap[0..SEGMENT_HEADER_SIZE])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let table_start = SEGMENT_HEADER_SIZE + header.pattern_table_len() as usize;
+    let mut original = 0u64;
+    let mut compressed = 0u64;
+    for i in 0..header.chunk_count {
+        let off = table_start + (i as usize) * CHUNK_ENTRY_SIZE;
+        if off + CHUNK_ENTRY_SIZE > mmap.len() - SEGMENT_FOOTER_SIZE {
+            break;
+        }
+        if let Ok(chunk) = ChunkEntry::from_bytes(&mmap[off..off + CHUNK_ENTRY_SIZE]) {
+            original += chunk.original_sz as u64;
+            compressed += chunk.compressed_sz as u64;
+        }
+    }
+    Ok((original, compressed))
+}
 
     // ---------- 私有：Segment v2 写入 ----------
 

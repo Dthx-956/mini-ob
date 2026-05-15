@@ -32,9 +32,9 @@ SERVICES = ["nginx", "auth", "payment", "db", "cache", "gateway", "order"]
 # 高重复度模板是压缩比的关键
 TEMPLATES: List[Tuple[str, str, str]] = [
     # (service, level, template_with_placeholders)
-    ("nginx", "I", "{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} {bytes} "{referer}" "{ua}" {latency}ms"),
-    ("nginx", "W", "{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} {bytes} - {latency}ms [SLOW]"),
-    ("nginx", "E", "{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} 0 "-" "-" upstream_timeout"),
+    ('nginx', 'I', '{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} {bytes} "{referer}" "{ua}" {latency}ms'),
+    ('nginx', 'W', '{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} {bytes} - {latency}ms [SLOW]'),
+    ('nginx', 'E', '{client_ip} - - [{time}] "{method} {path} HTTP/1.1" {status} 0 "-" "-" upstream_timeout'),
 
     ("auth", "I", "User {user_id} login success from {client_ip} device={device} session={session_id}"),
     ("auth", "W", "User {user_id} login failed (attempt {attempt}/5) from {client_ip} reason={reason}"),
@@ -168,7 +168,7 @@ def generate_line(ts: int, template_idx: int = None) -> dict:
     }
 
 
-def generate_logs(lines: int, output: str, burst: bool = False, seed: int = 42):
+def generate_logs(lines: int, output: str, append: bool = False, burst: bool = False, seed: int = 42):
     """主生成函数"""
     random.seed(seed)
 
@@ -181,7 +181,8 @@ def generate_logs(lines: int, output: str, burst: bool = False, seed: int = 42):
     else:
         burst_start = burst_end = -1
 
-    with open(output, 'w', encoding='utf-8') as f:
+    mode = 'a' if append else 'w'
+    with open(output, mode, encoding='utf-8') as f:
         for i in range(lines):
             # 时间戳：基础递增 + 随机抖动（模拟真实间隔不均匀）
             jitter = random.randint(1, 500) if random.random() < 0.1 else random.randint(1, 50)
@@ -205,7 +206,8 @@ def generate_logs(lines: int, output: str, burst: bool = False, seed: int = 42):
     print()  # 换行
 
     # 统计输出
-    file_size = open(output, 'rb').seek(0, 2) or 0
+    import os
+    file_size = os.path.getsize(output)
     print(f"\n✅ 生成完成: {output}")
     print(f"   行数: {lines:,}")
     print(f"   大小: {file_size / 1024 / 1024:.2f} MB")
@@ -225,6 +227,7 @@ def main():
     parser.add_argument("--output", type=str, default="/tmp/mini-obs-test.log", help="输出文件路径")
     parser.add_argument("--burst", action="store_true", help="启用流量突发模式（中间 20% 密度翻倍）")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，保证可复现")
+    parser.add_argument("--append", action="store_true", help="追加模式写入（不覆盖已有文件）")
     args = parser.parse_args()
 
     print(f"Mini-OBS 日志生成器")
@@ -234,7 +237,7 @@ def main():
     print(f"随机种子: {args.seed}")
     print("-" * 40)
 
-    generate_logs(args.lines, args.output, args.burst, args.seed)
+    generate_logs(args.lines, args.output, args.append, args.burst, args.seed)
 
 
 if __name__ == "__main__":

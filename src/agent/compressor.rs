@@ -442,7 +442,7 @@ fn test_compressor_large_batch() {
 
 #[test]
 fn test_compressor_compression_ratio_target() {
-    // 模拟高重复度模板日志，验证能否达到 >10x
+    // 模拟高重复度模板日志，验证能否达到 >5x
     let comp = Compressor::new(CompressorConfig::default());
     let template_msg = "User {id} performed action {action} on resource {resource} at {time} from {ip}";
     let logs: Vec<LogLine> = (0..5000)
