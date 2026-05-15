@@ -1,10 +1,10 @@
-//! mini-obs 命令行入口
+//! mini-obs 命令行入口 (v2 格式)
 //!
 //! 子命令：
-//!   agent   <data-dir> <service> <log-file>   启动采集代理（前台运行）
-//!   query   <data-dir> <start> <end> [keyword] 查询存储的日志
-//!   generate <count> <output>                   生成测试日志文件
-//!   stats   <data-dir>                        显示存储统计
+//!   agent   <data-dir> <service> <log-file>        启动采集代理（前台运行）
+//!   query   <data-dir> <start> <end> [keyword] [limit] 查询存储的日志
+//!   generate <count> <output> [service]            生成测试日志文件
+//!   stats   <data-dir>                             显示存储统计
 
 use std::env;
 use std::io::{self, Write};
@@ -15,21 +15,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mini_obs::agent::{
     Collector, CollectorConfig, SourceType, StorageConfig, StorageEngine,
 };
-use mini_obs::shared::format::LogLine;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage() {
-    eprintln!("Mini-OBS Edge Log Agent  v0.1.0");
+    eprintln!("Mini-OBS Edge Log Agent  v{}", VERSION);
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  mini-obs agent   <data-dir> <service-name> <log-file>   Run agent (tail mode)");
-    eprintln!("  mini-obs query   <data-dir> <start-ts> <end-ts> [keyword]  Query logs");
-    eprintln!("  mini-obs generate <count> <output-file>               Generate test logs");
-    eprintln!("  mini-obs stats   <data-dir>                           Show storage stats");
+    eprintln!("  mini-obs agent   <data-dir> <service-name> <log-file>      Run agent (tail mode)");
+    eprintln!("  mini-obs query   <data-dir> <start-ts> <end-ts> [keyword] [limit]  Query logs");
+    eprintln!("  mini-obs generate <count> <output-file> [service-name]     Generate test logs");
+    eprintln!("  mini-obs stats   <data-dir>                                Show storage stats");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  mini-obs agent /data/mini-obs nginx /var/log/nginx/access.log");
-    eprintln!("  mini-obs query /data/mini-obs 0 9999999999999 ERROR");
-    eprintln!("  mini-obs generate 10000 /tmp/test.log");
+    eprintln!("  mini-obs query /data/mini-obs 0 9999999999999 ERROR 50");
+    eprintln!("  mini-obs generate 10000 /tmp/test.log my-service");
 }
 
 fn main() {
@@ -95,7 +96,6 @@ fn cmd_agent(args: &[String]) -> io::Result<()> {
     println!("[mini-obs] Agent running. Press Ctrl+C to stop.");
 
     // 桥接：从 collector 接收，写入 storage
-    // 使用 recv_timeout 允许定期检查，未来可接入信号处理优雅退出
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(log) => {
@@ -116,17 +116,29 @@ fn cmd_agent(args: &[String]) -> io::Result<()> {
 /// 查询已存储的日志
 fn cmd_query(args: &[String]) -> io::Result<()> {
     if args.len() < 5 {
-        eprintln!("Usage: mini-obs query <data-dir> <start-ts> <end-ts> [keyword]");
+        eprintln!("Usage: mini-obs query <data-dir> <start-ts> <end-ts> [keyword] [limit]");
         process::exit(1);
     }
 
     let data_dir = &args[2];
-    let start: u64 = args[3].parse().unwrap_or(0);
-    let end: u64 = args[4].parse().unwrap_or(u64::MAX);
+    let start: u64 = args[3]
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid start timestamp"))?;
+    let end: u64 = args[4]
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid end timestamp"))?;
     let keyword = args.get(5).map(|s| s.as_str()).unwrap_or("");
+    let limit: usize = args
+        .get(6)
+        .map(|s| {
+            s.parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid limit"))
+        })
+        .transpose()?
+        .unwrap_or(100);
 
     let engine = StorageEngine::open(data_dir, StorageConfig::default())?;
-    let results = engine.query(start, end, keyword, 100)?;
+    let results = engine.query(start, end, keyword, limit)?;
 
     println!("[mini-obs] Query returned {} results:", results.len());
     for log in results {
@@ -145,12 +157,15 @@ fn cmd_query(args: &[String]) -> io::Result<()> {
 /// 生成测试日志文件（JSON Lines 格式）
 fn cmd_generate(args: &[String]) -> io::Result<()> {
     if args.len() < 4 {
-        eprintln!("Usage: mini-obs generate <count> <output-file>");
+        eprintln!("Usage: mini-obs generate <count> <output-file> [service-name]");
         process::exit(1);
     }
 
-    let count: usize = args[2].parse().unwrap_or(1000);
+    let count: usize = args[2]
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid count"))?;
     let output = &args[3];
+    let service = args.get(4).map(|s| s.as_str()).unwrap_or("app");
 
     let mut file = std::fs::File::create(output)?;
     let messages = [
@@ -181,8 +196,8 @@ fn cmd_generate(args: &[String]) -> io::Result<()> {
             "I"
         };
         let line = format!(
-            r#"{{"t":{},"s":"app","l":"{}","m":"{} [seq={}]"}}"#,
-            ts, lvl, msg, i
+            r#"{{"t":{},"s":"{}","l":"{}","m":"{} [seq={}]"}}"#,
+            ts, service, lvl, msg, i
         );
         writeln!(file, "{}", line)?;
     }

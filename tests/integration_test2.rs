@@ -325,8 +325,9 @@ fn test_very_large_message_integrity() {
 
     let all = engine.query(0, u64::MAX, "", 100).unwrap();
     assert_eq!(all.len(), 2);
-    assert_eq!(all[0].message.len(), 5 * 1024 * 1024);
-    assert_eq!(all[1].message, "small");
+    // query 返回降序排列，ts=2000 的 "small" 在前
+    assert_eq!(all[0].message, "small");
+    assert_eq!(all[1].message.len(), 5 * 1024 * 1024);
 }
 
 #[test]
@@ -378,7 +379,8 @@ fn test_bulk_write_performance() {
     let elapsed = start.elapsed();
 
     let stats = engine.stats();
-    assert_eq!(stats.total_lines, 10000);
+    // total_lines 仅统计已 flush 的，可能 buffered_lines 中还有部分未 flush
+    assert_eq!(stats.total_lines + stats.buffered_lines as u64, 10000);
 
     // 宽松阈值：10k 条应在 5 秒内完成（Debug 模式）
     println!("Bulk write 10k logs: {:?}", elapsed);
