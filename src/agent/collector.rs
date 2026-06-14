@@ -313,12 +313,28 @@ fn parse_line(line: &str, default_service: &str) -> Option<LogLine> {
     }
 
     // 策略3：降级为原始行
+    // 已推断出级别，把它从 message 中剥离，避免重复存储。
+    let level = infer_level(trimmed);
+    let message = strip_level_prefix(trimmed);
     Some(LogLine {
         ts: now_ms(),
         service: default_service.to_string(),
-        level: infer_level(trimmed),
-        message: trimmed.to_string(),
+        level,
+        message,
     })
+}
+
+/// 剥离日志行中的级别前缀（INFO / WARN / ERROR / FATAL），
+/// 使降级路径生成的 message 不再包含已提取的级别字段。
+fn strip_level_prefix(line: &str) -> String {
+    let upper = line.to_uppercase();
+    // 优先匹配 ERROR/FATAL，避免 "INFO ERROR ..." 被误剥成 INFO 之后的内容
+    for (prefix, len) in [("ERROR ", 6), ("FATAL ", 6), ("WARN ", 5), ("INFO ", 5)] {
+        if let Some(pos) = upper.find(prefix) {
+            return line[pos + len..].to_string();
+        }
+    }
+    line.to_string()
 }
 
 /// 从 JSON Value 提取 LogLine（兼容标准格式和紧凑格式）
@@ -484,6 +500,37 @@ mod tests {
         assert_eq!(log.level, "E");
         assert!(log.message.contains("something went wrong"));
         assert_eq!(log.service, "app");
+    }
+
+    #[test]
+    fn test_fallback_strips_level_prefix() {
+        // HDFS 风格：头部时间戳 + 级别 + 消息
+        let line = "081109 203615 148 INFO PacketResponder 1 for block blk_38865049064139660 terminating";
+        let log = parse_line(line, "hdfs").unwrap();
+        assert_eq!(log.level, "I");
+        assert_eq!(log.message, "PacketResponder 1 for block blk_38865049064139660 terminating");
+        assert!(!log.message.contains("INFO"));
+    }
+
+    #[test]
+    fn test_fallback_strips_warn_prefix() {
+        let line = "2026-05-11 14:30:00 WARN low memory";
+        let log = parse_line(line, "app").unwrap();
+        assert_eq!(log.level, "W");
+        assert_eq!(log.message, "low memory");
+    }
+
+    #[test]
+    fn test_fallback_strips_case_insensitive() {
+        let line = "server started info ready";
+        let log = parse_line(line, "app").unwrap();
+        assert_eq!(log.level, "I");
+        assert_eq!(log.message, "ready");
+    }
+
+    #[test]
+    fn test_strip_level_prefix_no_match() {
+        assert_eq!(strip_level_prefix("no level here"), "no level here");
     }
 
     #[test]

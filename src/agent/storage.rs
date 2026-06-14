@@ -624,6 +624,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             .decompress_batch(compressed)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        let initial_count = results.len();
         for log in batch {
             if log.ts >= start && log.ts <= end {
                 if log.service.contains(keyword)
@@ -631,7 +632,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                     || log.message.contains(keyword)
                 {
                     results.push(log);
-                    if results.len() >= limit {
+                    if results.len() - initial_count >= limit {
                         return Ok(());
                     }
                 }
@@ -709,8 +710,9 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // 5. 遍历 Chunk，两阶段过滤
+        let initial_result_count = results.len();
         for i in 0..chunk_count {
-            if results.len() >= limit {
+            if results.len() - initial_result_count >= limit {
                 break;
             }
 
@@ -762,7 +764,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                     let msg_match = log.message.contains(keyword);
                     if svc_match || lvl_match || msg_match {
                         results.push(log);
-                        if results.len() >= limit {
+                        if results.len() - initial_result_count >= limit {
                             return Ok(());
                         }
                     }
