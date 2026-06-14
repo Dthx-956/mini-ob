@@ -82,6 +82,7 @@ fn cmd_agent(args: &[String]) -> io::Result<()> {
             compression_level: 3,
             chunk_size: 256,
             dict: None,
+            ..Default::default()
         },
     )?;
 

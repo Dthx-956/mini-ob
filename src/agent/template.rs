@@ -2,8 +2,9 @@
 //! 模板提取与 64-bit XOR-P 参数编码
 //!
 //! 核心设计：
-//! - Batch 级模板提取：按 token 长度分组，组内聚类公共模式
+//! - Batch 级模板提取：按空格/标点分词，组内聚类公共模式
 //! - 无匹配 → 自动创建新模板，保留原始字符
+//! - 强类型参数：对整数、十六进制、IPv4 等常见日志参数做二进制编码
 //! - XOR-P 按 ARM64 字长（64-bit / 8 bytes）对齐操作
 //! - 编码格式：bitmap + literals，紧凑且 SIMD 友好
 
@@ -13,6 +14,168 @@ use std::io;
 use crate::shared::format::LogLine;
 
 // ==================== 数据模型 ====================
+
+/// 参数类型：用于将文本参数压缩为强类型二进制
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamType {
+    /// 普通字符串，按 UTF-8 原样存储
+    String = 0,
+    /// 有符号整数（i64 little-endian）
+    Integer = 1,
+    /// 十六进制整数（0x...，u64 little-endian）
+    Hex = 2,
+    /// IPv4 地址（4 bytes）
+    IPv4 = 3,
+}
+
+impl ParamType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ParamType::String),
+            1 => Some(ParamType::Integer),
+            2 => Some(ParamType::Hex),
+            3 => Some(ParamType::IPv4),
+            _ => None,
+        }
+    }
+}
+
+/// 强类型参数：类型 + 二进制表示
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedParam {
+    pub ty: ParamType,
+    pub bytes: Vec<u8>,
+}
+
+impl TypedParam {
+    /// 从字符串自动检测类型并编码。
+    /// 仅在能保证无损往返时才启用强类型编码。
+    pub fn from_str(s: &str) -> Self {
+        if let Some(bytes) = Self::try_ipv4(s) {
+            return Self { ty: ParamType::IPv4, bytes };
+        }
+        if let Some(bytes) = Self::try_hex(s) {
+            return Self { ty: ParamType::Hex, bytes };
+        }
+        if let Some(bytes) = Self::try_integer(s) {
+            return Self { ty: ParamType::Integer, bytes };
+        }
+        Self {
+            ty: ParamType::String,
+            bytes: s.as_bytes().to_vec(),
+        }
+    }
+
+    /// 解码为原始字符串
+    pub fn to_string(&self) -> String {
+        match self.ty {
+            ParamType::String => String::from_utf8_lossy(&self.bytes).to_string(),
+            ParamType::Integer => {
+                if self.bytes.len() >= 8 {
+                    let v = i64::from_le_bytes([
+                        self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+                        self.bytes[4], self.bytes[5], self.bytes[6], self.bytes[7],
+                    ]);
+                    format!("{}", v)
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+            ParamType::Hex => {
+                if self.bytes.len() >= 8 {
+                    let v = u64::from_le_bytes([
+                        self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+                        self.bytes[4], self.bytes[5], self.bytes[6], self.bytes[7],
+                    ]);
+                    format!("0x{:x}", v)
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+            ParamType::IPv4 => {
+                if self.bytes.len() >= 4 {
+                    format!("{}.{}.{}.{}", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3])
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+        }
+    }
+
+    fn try_integer(s: &str) -> Option<Vec<u8>> {
+        // 拒绝前导零、正号等会导致往返不一致的格式
+        if s.is_empty() || s == "-" {
+            return None;
+        }
+        let mut chars = s.chars();
+        let first = chars.next().unwrap();
+        if first == '+' {
+            return None;
+        }
+        if first == '0' && s.len() > 1 {
+            return None; // 前导零，保持字符串
+        }
+        if first == '-' && s.len() > 1 && s.as_bytes()[1] == b'0' {
+            return None; // -0xxx 保持字符串
+        }
+        for c in chars {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+        }
+        let v: i64 = s.parse().ok()?;
+        Some(v.to_le_bytes().to_vec())
+    }
+
+    fn try_hex(s: &str) -> Option<Vec<u8>> {
+        if s.len() < 3 {
+            return None;
+        }
+        let bytes = s.as_bytes();
+        if bytes[0] != b'0' || (bytes[1] != b'x' && bytes[1] != b'X') {
+            return None;
+        }
+        // 只接受小写 0x 前缀，避免大小写往返不一致
+        if bytes[1] != b'x' {
+            return None;
+        }
+        // 拒绝前导零，如 0x00abc
+        if s.len() > 3 && bytes[2] == b'0' {
+            return None;
+        }
+        let payload = &s[2..];
+        if payload.is_empty() {
+            return None;
+        }
+        for c in payload.chars() {
+            if !c.is_ascii_hexdigit() {
+                return None;
+            }
+        }
+        let v = u64::from_str_radix(payload, 16).ok()?;
+        Some(v.to_le_bytes().to_vec())
+    }
+
+    fn try_ipv4(s: &str) -> Option<Vec<u8>> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let mut result = Vec::with_capacity(4);
+        for p in parts {
+            if p.is_empty() || p.len() > 3 {
+                return None;
+            }
+            // 拒绝前导零
+            if p.len() > 1 && p.as_bytes()[0] == b'0' {
+                return None;
+            }
+            let v: u8 = p.parse().ok()?;
+            result.push(v);
+        }
+        Some(result)
+    }
+}
 
 /// 模板片段：固定文本或参数占位符
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +200,8 @@ pub struct TemplateRecord {
     pub svc_id: u8,
     pub level: String,
     pub pat_id: u16,
-    /// 参数值，与模板中的 Param 一一对应
-    pub params: Vec<String>,
+    /// 强类型参数值，与模板中的 Param 一一对应
+    pub params: Vec<TypedParam>,
 }
 
 /// 一批日志的模板化结果
@@ -63,7 +226,7 @@ pub struct EncodedRecord {
 pub struct ParamEncoding {
     /// Chunk 内参考行索引（0 = 本 Chunk 首行存原始值）
     pub ref_idx: u16,
-    /// 编码后字节流：u16(num_chunks) + bitmap + [u64 literals...]
+    /// 编码后字节流：u32(param_count) + [u8 type + payload]...
     pub data: Vec<u8>,
 }
 
@@ -158,26 +321,33 @@ impl TemplateExtractor {
     /// ref_reset: 每 N 行重置参考行（默认 16，查询友好）
     pub fn encode_xor(batch: &TemplateBatch, ref_reset: usize) -> Vec<EncodedRecord> {
         let mut result = Vec::with_capacity(batch.records.len());
-        let mut ref_params: Vec<String> = Vec::new();
+        let mut ref_params: Vec<TypedParam> = Vec::new();
         let mut ref_idx = 0usize;
 
         for (i, rec) in batch.records.iter().enumerate() {
             let mut encoding_data = Vec::new();
             encoding_data.extend_from_slice(&(rec.params.len() as u32).to_le_bytes());
 
-            if i % ref_reset == 0 {
-                // 重置参考行：直接存储原始参数值（原始字符串，非 XOR-P）
+            // 当参数数量或类型与参考行不一致时，当前行必须作为新的参考行，
+            // 否则 zip 截断会导致参数丢失，解压后数据损坏。
+            let need_new_ref = i % ref_reset == 0
+                || rec.params.len() != ref_params.len()
+                || rec.params.iter().zip(ref_params.iter()).any(|(a, b)| a.ty != b.ty);
+
+            if need_new_ref {
+                // 重置参考行：直接存储原始参数值（强类型二进制）
                 ref_params = rec.params.clone();
                 ref_idx = i;
                 for p in &rec.params {
-                    let bytes = p.as_bytes();
-                    encoding_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    encoding_data.extend_from_slice(bytes);
+                    encoding_data.push(p.ty as u8);
+                    encoding_data.extend_from_slice(&(p.bytes.len() as u32).to_le_bytes());
+                    encoding_data.extend_from_slice(&p.bytes);
                 }
             } else {
-                // 非参考行：XOR-P 编码
+                // 非参考行：XOR-P 编码（在强类型二进制上执行）
                 for (p, base) in rec.params.iter().zip(ref_params.iter()) {
-                    let encoded = Self::xor_param_64bit(p, base);
+                    encoding_data.push(p.ty as u8);
+                    let encoded = Self::xor_param_bytes(&p.bytes, &base.bytes);
                     encoding_data.extend_from_slice(&encoded);
                 }
             }
@@ -197,8 +367,8 @@ impl TemplateExtractor {
         result
     }
 
-    /// 解码 XOR-P 编码的记录（需传入参考行的参数值）
-    pub fn decode_xor(encoded: &EncodedRecord, ref_params: &[String]) -> Vec<String> {
+    /// 解码 XOR-P 编码的记录（需传入参考行的强类型参数）
+    pub fn decode_xor(encoded: &EncodedRecord, ref_params: &[TypedParam]) -> Vec<TypedParam> {
         let mut params = Vec::new();
         let data = &encoded.param_encoding.data;
         let mut offset = 0;
@@ -212,18 +382,34 @@ impl TemplateExtractor {
         if encoded.param_encoding.ref_idx == 0 {
             // 参考行：直接读取原始参数
             for _ in 0..param_count {
+                if offset >= data.len() {
+                    break;
+                }
+                let ty = ParamType::from_u8(data[offset]).unwrap_or(ParamType::String);
+                offset += 1;
+                if offset + 4 > data.len() {
+                    break;
+                }
                 let len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
                 offset += 4;
-                let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+                if offset + len > data.len() {
+                    break;
+                }
+                let bytes = data[offset..offset + len].to_vec();
                 offset += len;
-                params.push(s);
+                params.push(TypedParam { ty, bytes });
             }
         } else {
             // 非参考行：XOR-P 解码
             for i in 0..param_count {
-                let base = ref_params.get(i).map(|s| s.as_str()).unwrap_or("");
-                let (param, consumed) = Self::decode_xor_param_64bit(&data[offset..], base);
-                params.push(param);
+                if offset >= data.len() {
+                    break;
+                }
+                let ty = ParamType::from_u8(data[offset]).unwrap_or(ParamType::String);
+                offset += 1;
+                let base = ref_params.get(i).map(|p| p.bytes.as_slice()).unwrap_or(&[]);
+                let (decoded_bytes, consumed) = Self::decode_xor_param_bytes(&data[offset..], base);
+                params.push(TypedParam { ty, bytes: decoded_bytes });
                 offset += consumed;
             }
         }
@@ -277,7 +463,7 @@ impl TemplateExtractor {
             .collect()
     }
 
-    fn build_record(log: &LogLine, pat_id: u16, params: Vec<String>, idx: usize) -> TemplateRecord {
+    fn build_record(log: &LogLine, pat_id: u16, params: Vec<TypedParam>, idx: usize) -> TemplateRecord {
         TemplateRecord {
             original_idx: idx,
             ts_delta: log.ts as i64,
@@ -313,37 +499,35 @@ impl TemplateExtractor {
             .collect::<String>()
     }
 
-    fn extract_params(tokens: &[String], template: &Template) -> Vec<String> {
+    fn extract_params(tokens: &[String], template: &Template) -> Vec<TypedParam> {
         let mut params = Vec::new();
         for (token, part) in tokens.iter().zip(template.parts.iter()) {
             if matches!(part, TemplatePart::Param) {
-                params.push(token.clone());
+                params.push(TypedParam::from_str(token));
             }
         }
         params
     }
 
-    fn extract_params_with_mask(tokens: &[String], is_fixed: &[bool]) -> Vec<String> {
+    fn extract_params_with_mask(tokens: &[String], is_fixed: &[bool]) -> Vec<TypedParam> {
         tokens
             .iter()
             .zip(is_fixed.iter())
-            .filter_map(|(t, fixed)| if !fixed { Some(t.clone()) } else { None })
+            .filter_map(|(t, fixed)| if !fixed { Some(TypedParam::from_str(t)) } else { None })
             .collect()
     }
 
-    // ---------- 64-bit XOR-P 编解码 ----------
+    // ---------- 64-bit XOR-P 编解码（字节级） ----------
 
-    /// 对单个参数值做 64-bit 对齐 XOR-P 编码
+    /// 对两个字节串做 64-bit 对齐 XOR-P 编码
     ///
     /// 格式：
     ///   u16  num_chunks    ← 多少个 8-byte 块
-    ///   u16  original_len  ← 原始字符串字节长度（解码时截断用）
+    ///   u16  original_len  ← 原始字节长度（解码时截断用）
     ///   [u8] bitmap        ← 每 bit 表示对应块是否非零（1 = 有差异）
     ///   [u8] literals      ← 仅对 bitmap=1 的块存储 8-byte XOR 值
-    pub fn xor_param_64bit(curr: &str, base: &str) -> Vec<u8> {
-        let curr_b = curr.as_bytes();
-        let base_b = base.as_bytes();
-        let max_len = ((curr_b.len().max(base_b.len()) + 7) / 8) * 8;
+    pub fn xor_param_bytes(curr: &[u8], base: &[u8]) -> Vec<u8> {
+        let max_len = ((curr.len().max(base.len()) + 7) / 8) * 8;
         let num_chunks = max_len / 8;
         let bitmap_len = (num_chunks + 7) / 8;
 
@@ -352,8 +536,8 @@ impl TemplateExtractor {
 
         for i in 0..num_chunks {
             let off = i * 8;
-            let c = Self::read_u64_le(curr_b, off, max_len);
-            let b = Self::read_u64_le(base_b, off, max_len);
+            let c = Self::read_u64_le(curr, off, max_len);
+            let b = Self::read_u64_le(base, off, max_len);
             let x = c ^ b;
 
             if x != 0 {
@@ -364,26 +548,25 @@ impl TemplateExtractor {
 
         let mut result = Vec::with_capacity(4 + bitmap_len + literals.len());
         result.extend_from_slice(&(num_chunks as u16).to_le_bytes());
-        result.extend_from_slice(&(curr_b.len() as u16).to_le_bytes());
+        result.extend_from_slice(&(curr.len() as u16).to_le_bytes());
         result.extend_from_slice(&bitmap);
         result.extend_from_slice(&literals);
         result
     }
 
-    pub fn decode_xor_param_64bit(data: &[u8], base: &str) -> (String, usize) {
+    pub fn decode_xor_param_bytes(data: &[u8], base: &[u8]) -> (Vec<u8>, usize) {
         if data.len() < 2 {
-            return (base.to_string(), 0);
+            return (base.to_vec(), 0);
         }
         let num_chunks = u16::from_le_bytes([data[0], data[1]]) as usize;
         let original_len = u16::from_le_bytes([data[2], data[3]]) as usize;
         let bitmap_len = (num_chunks + 7) / 8;
         let bitmap = &data[4..4 + bitmap_len];
 
-        let base_b = base.as_bytes();
         let max_len = num_chunks * 8;
         let mut buf = vec![0u8; max_len];
-        let copy_len = base_b.len().min(max_len);
-        buf[..copy_len].copy_from_slice(&base_b[..copy_len]);
+        let copy_len = base.len().min(max_len);
+        buf[..copy_len].copy_from_slice(&base[..copy_len]);
 
         let mut lit_offset = 4 + bitmap_len;
         let mut result_u64s = vec![0u64; num_chunks];
@@ -416,8 +599,7 @@ impl TemplateExtractor {
             buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
         }
 
-        let s = String::from_utf8_lossy(&buf[..original_len]).to_string();
-        (s, lit_offset)
+        (buf[..original_len].to_vec(), lit_offset)
     }
 
     pub fn read_u64_le(bytes: &[u8], offset: usize, len: usize) -> u64 {
@@ -447,6 +629,54 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_param_integer() {
+        let p = TypedParam::from_str("12345");
+        assert_eq!(p.ty, ParamType::Integer);
+        assert_eq!(p.to_string(), "12345");
+        assert_eq!(p.bytes.len(), 8);
+    }
+
+    #[test]
+    fn test_typed_param_hex() {
+        let p = TypedParam::from_str("0x80004005");
+        assert_eq!(p.ty, ParamType::Hex);
+        assert_eq!(p.to_string(), "0x80004005");
+        assert_eq!(p.bytes.len(), 8);
+    }
+
+    #[test]
+    fn test_typed_param_ipv4() {
+        let p = TypedParam::from_str("192.168.1.1");
+        assert_eq!(p.ty, ParamType::IPv4);
+        assert_eq!(p.to_string(), "192.168.1.1");
+        assert_eq!(p.bytes.len(), 4);
+    }
+
+    #[test]
+    fn test_typed_param_string() {
+        let p = TypedParam::from_str("hello-world");
+        assert_eq!(p.ty, ParamType::String);
+        assert_eq!(p.to_string(), "hello-world");
+    }
+
+    #[test]
+    fn test_typed_param_reject_leading_zeros() {
+        // 前导零会导致往返不一致，应保持字符串
+        let p = TypedParam::from_str("007");
+        assert_eq!(p.ty, ParamType::String);
+        assert_eq!(p.to_string(), "007");
+    }
+
+    #[test]
+    fn test_xor_bytes_roundtrip() {
+        let base = b"192.168.1.100";
+        let curr = b"192.168.1.200";
+        let encoded = TemplateExtractor::xor_param_bytes(curr, base);
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base);
+        assert_eq!(decoded, curr);
+    }
+
+    #[test]
     fn test_template_extraction_basic() {
         let logs = vec![
             make_log(0, "User 12345 logged in from 192.168.1.1"),
@@ -465,11 +695,10 @@ mod tests {
         // User 模板应有 2 个参数（user_id, ip）
         let user_rec = &batch.records[0];
         assert_eq!(user_rec.params.len(), 2);
-        assert_eq!(user_rec.params[0], "12345");
-        assert_eq!(user_rec.params[1], "192.168.1.1");
+        assert_eq!(user_rec.params[0].to_string(), "12345");
+        assert_eq!(user_rec.params[1].to_string(), "192.168.1.1");
 
-        // Query 模板应有 1 个参数（table）和 1 个参数（time）？
-        // 实际上 "SELECT * FROM users" 中 "users" 是参数，"45ms" 是参数
+        // Query 模板应有参数
         let query_rec = &batch.records[3];
         assert!(query_rec.params.len() >= 1);
     }
@@ -495,22 +724,18 @@ mod tests {
         let base = "192.168.1.100";
         let curr = "192.168.1.200";
 
-        let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-        let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
+        let encoded = TemplateExtractor::xor_param_bytes(curr.as_bytes(), base.as_bytes());
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base.as_bytes());
 
-        assert_eq!(decoded, curr);
+        assert_eq!(decoded, curr.as_bytes());
     }
 
     #[test]
     fn test_xor_identical() {
         let s = "hello_world_12345";
-        let encoded = TemplateExtractor::xor_param_64bit(s, s);
-        // 完全相同：bitmap 全零，只有头部
-        // 17 bytes → 3 chunks → bitmap = ceil(3/8) = 1 byte
-        // 格式：u16 num_chunks + u16 original_len + bitmap = 2 + 2 + 1 = 5
-        assert_eq!(encoded.len(), 5);
-        let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, s);
-        assert_eq!(decoded, s);
+        let encoded = TemplateExtractor::xor_param_bytes(s.as_bytes(), s.as_bytes());
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, s.as_bytes());
+        assert_eq!(decoded, s.as_bytes());
     }
 
     #[test]
@@ -535,7 +760,10 @@ mod tests {
         // 解码验证
         let ref_params = batch.records[0].params.clone();
         let decoded = TemplateExtractor::decode_xor(&encoded[1], &ref_params);
-        assert_eq!(decoded, batch.records[1].params);
+        assert_eq!(decoded.len(), batch.records[1].params.len());
+        for (a, b) in decoded.iter().zip(batch.records[1].params.iter()) {
+            assert_eq!(a.to_string(), b.to_string());
+        }
     }
 
     #[test]
@@ -557,237 +785,223 @@ mod tests {
 
     #[test]
     fn test_64bit_alignment() {
-        // 验证 8 字节对齐：长度 5 和长度 13 都 padding 到 8/16
-        let short = "12345";        // 5 bytes → 1 chunk (8 bytes)
-        let long = "1234567890123"; // 13 bytes → 2 chunks (16 bytes)
+        // 验证 8 字节对齐
+        let short = b"12345";        // 5 bytes → 1 chunk (8 bytes)
+        let long = b"1234567890123"; // 13 bytes → 2 chunks (16 bytes)
 
-        let enc1 = TemplateExtractor::xor_param_64bit(short, short);
-        let enc2 = TemplateExtractor::xor_param_64bit(long, long);
+        let enc1 = TemplateExtractor::xor_param_bytes(short, short);
+        let enc2 = TemplateExtractor::xor_param_bytes(long, long);
 
-        // 相同内容编码后：num_chunks 不同，bitmap 都应为零
         let chunks1 = u16::from_le_bytes([enc1[0], enc1[1]]);
         let chunks2 = u16::from_le_bytes([enc2[0], enc2[1]]);
         assert_eq!(chunks1, 1);
         assert_eq!(chunks2, 2);
 
-        // 验证 original_len 正确存储
         let len1 = u16::from_le_bytes([enc1[2], enc1[3]]);
         let len2 = u16::from_le_bytes([enc2[2], enc2[3]]);
         assert_eq!(len1, 5);
         assert_eq!(len2, 13);
     }
-// 将以下内容追加到 src/agent/template.rs 的 #[cfg(test)] mod tests 中
 
-#[test]
-fn test_extract_empty_batch() {
-    let empty: Vec<LogLine> = vec![];
-    let batch = TemplateExtractor::extract(&empty);
-    assert!(batch.templates.is_empty());
-    assert!(batch.records.is_empty());
-}
-
-#[test]
-fn test_extract_single_log() {
-    let logs = vec![make_log(0, "only one log message")];
-    let batch = TemplateExtractor::extract(&logs);
-    assert_eq!(batch.templates.len(), 1);
-    assert_eq!(batch.records.len(), 1);
-    assert_eq!(batch.records[0].params.len(), 0); // 单条无参数
-}
-
-#[test]
-fn test_extract_identical_messages() {
-    // 完全相同的 message 应归为同一模板，无参数
-    let logs: Vec<LogLine> = (0..5)
-        .map(|i| make_log(i, "Identical log message here"))
-        .collect();
-    let batch = TemplateExtractor::extract(&logs);
-    assert_eq!(batch.templates.len(), 1);
-    assert_eq!(batch.records.len(), 5);
-    for rec in &batch.records {
-        assert_eq!(rec.params.len(), 0);
+    #[test]
+    fn test_extract_empty_batch() {
+        let empty: Vec<LogLine> = vec![];
+        let batch = TemplateExtractor::extract(&empty);
+        assert!(batch.templates.is_empty());
+        assert!(batch.records.is_empty());
     }
-}
 
-#[test]
-fn test_extract_unicode_params() {
-    let logs = vec![
-        make_log(0, "用户 张三 登录成功"),
-        make_log(1, "用户 李四 登录成功"),
-        make_log(2, "用户 王五 登录成功"),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    assert_eq!(batch.templates.len(), 1);
-    assert_eq!(batch.records.len(), 3);
-    assert_eq!(batch.records[0].params.len(), 1);
-    assert_eq!(batch.records[0].params[0], "张三");
-    assert_eq!(batch.records[1].params[0], "李四");
-}
+    #[test]
+    fn test_extract_single_log() {
+        let logs = vec![make_log(0, "only one log message")];
+        let batch = TemplateExtractor::extract(&logs);
+        assert_eq!(batch.templates.len(), 1);
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].params.len(), 0); // 单条无参数
+    }
 
-#[test]
-fn test_extract_emoji_and_special() {
-    let logs = vec![
-        make_log(0, "🎉 Party at 2026-05-15 with 🎂"),
-        make_log(1, "🎉 Party at 2026-05-16 with 🎁"),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    assert_eq!(batch.templates.len(), 1);
-    assert_eq!(batch.records.len(), 2);
-    // "2026-05-15" 和 "🎂"/"🎁" 是参数
-    assert!(batch.records[0].params.len() >= 1);
-}
-
-#[test]
-fn test_extract_very_long_message() {
-    let long_base = "a".repeat(4096);
-    let logs = vec![
-        make_log(0, &format!("{} {}", long_base, "suffix1")),
-        make_log(1, &format!("{} {}", long_base, "suffix2")),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    assert_eq!(batch.templates.len(), 1);
-    assert_eq!(batch.records.len(), 2);
-}
-
-#[test]
-fn test_extract_no_common_pattern() {
-    // 同一长度但完全不同内容
-    let logs = vec![
-        make_log(0, "Alpha beta gamma"),
-        make_log(1, "One two three four"),
-        make_log(2, "Xyzzy plugh plover"),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    // 3 条同长度，但逐 token 比较后无公共模式
-    // 实际行为：组内聚类，first 与后续比较，标记变化位置
-    // "Alpha" vs "One" -> 不同 -> Param
-    // "beta" vs "two" -> 不同 -> Param
-    // ... 最终可能整个模板都是 Param
-    assert!(batch.templates.len() >= 1);
-    assert_eq!(batch.records.len(), 3);
-}
-
-#[test]
-fn test_xor_param_length_mismatch() {
-    let base = "short";
-    let curr = "this is a much longer string with many characters";
-    let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-    let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
-    assert_eq!(decoded, curr);
-}
-
-#[test]
-fn test_xor_param_base_longer_than_curr() {
-    let base = "this is the long base string for testing";
-    let curr = "tiny";
-    let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-    let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
-    assert_eq!(decoded, curr);
-}
-
-#[test]
-fn test_xor_param_empty_string() {
-    let base = "nonempty";
-    let curr = "";
-    let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-    let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
-    assert_eq!(decoded, "");
-}
-
-#[test]
-fn test_xor_param_exactly_8_bytes() {
-    let base = "12345678";
-    let curr = "abcdefgh";
-    let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-    // 1 chunk, bitmap 可能非零
-    let chunks = u16::from_le_bytes([encoded[0], encoded[1]]);
-    assert_eq!(chunks, 1);
-    let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
-    assert_eq!(decoded, curr);
-}
-
-#[test]
-fn test_xor_param_exactly_16_bytes() {
-    let base = "1234567890123456";
-    let curr = "abcdefghijklmnop";
-    let encoded = TemplateExtractor::xor_param_64bit(curr, base);
-    let chunks = u16::from_le_bytes([encoded[0], encoded[1]]);
-    assert_eq!(chunks, 2);
-    let (decoded, _) = TemplateExtractor::decode_xor_param_64bit(&encoded, base);
-    assert_eq!(decoded, curr);
-}
-
-#[test]
-fn test_encode_xor_empty_params() {
-    // 无参数日志的 XOR 编码
-    let logs = vec![
-        make_log(0, "No params here"),
-        make_log(1, "No params here"),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    let encoded = TemplateExtractor::encode_xor(&batch, 16);
-    assert_eq!(encoded.len(), 2);
-    // 参数数量为 0，编码数据应很短
-    assert_eq!(encoded[0].param_encoding.data.len(), 4); // 仅 u32 param_count = 0
-}
-
-#[test]
-fn test_template_batch_pattern_table_roundtrip() {
-    let logs = vec![
-        make_log(0, "User 12345 logged in from 192.168.1.1"),
-        make_log(1, "User 67890 logged in from 192.168.1.2"),
-        make_log(2, "Query SELECT * FROM users executed in 45ms"),
-        make_log(3, "Query SELECT * FROM orders executed in 120ms"),
-    ];
-    let batch = TemplateExtractor::extract(&logs);
-    let table = batch.serialize_pattern_table();
-    let templates = TemplateBatch::deserialize_pattern_table(&table).unwrap();
-
-    assert_eq!(templates.len(), batch.templates.len());
-    for (a, b) in batch.templates.iter().zip(templates.iter()) {
-        assert_eq!(a.parts.len(), b.parts.len());
-        for (pa, pb) in a.parts.iter().zip(b.parts.iter()) {
-            assert_eq!(pa, pb);
+    #[test]
+    fn test_extract_identical_messages() {
+        let logs: Vec<LogLine> = (0..5)
+            .map(|i| make_log(i, "Identical log message here"))
+            .collect();
+        let batch = TemplateExtractor::extract(&logs);
+        assert_eq!(batch.templates.len(), 1);
+        assert_eq!(batch.records.len(), 5);
+        for rec in &batch.records {
+            assert_eq!(rec.params.len(), 0);
         }
     }
-}
 
-#[test]
-fn test_template_deserialize_error_truncated() {
-    let bad_data = vec![0x01, 0x00]; // 声称 1 个 part，但无后续数据
-    let result = Template::deserialize(&bad_data);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_template_deserialize_error_unknown_tag() {
-    let mut buf = vec![0x01, 0x00]; // 1 part
-    buf.push(0x99); // 未知 tag
-    let result = Template::deserialize(&buf);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_read_u64_le_bounds() {
-    let bytes = b"hello";
-    assert_eq!(TemplateExtractor::read_u64_le(bytes, 0, 5), 0x6f6c6c6568); // "hello" little-endian
-    assert_eq!(TemplateExtractor::read_u64_le(bytes, 10, 5), 0); // offset 越界
-    assert_eq!(TemplateExtractor::read_u64_le(bytes, 3, 5), 0x6f6c); // 部分读取
-}
-
-#[test]
-fn test_tokenize_various() {
-    let cases = vec![
-        ("simple", vec!["simple"]),
-        ("two words", vec!["two", " ", "words"]),
-        ("a,b.c", vec!["a", ",", "b.c"]),
-        ("num123_456", vec!["num123_456"]),
-    ];
-    for (input, expected) in cases {
-        let tokens = TemplateExtractor::tokenize(input);
-        assert_eq!(tokens, expected.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    #[test]
+    fn test_extract_unicode_params() {
+        let logs = vec![
+            make_log(0, "用户 张三 登录成功"),
+            make_log(1, "用户 李四 登录成功"),
+            make_log(2, "用户 王五 登录成功"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        assert_eq!(batch.templates.len(), 1);
+        assert_eq!(batch.records.len(), 3);
+        assert_eq!(batch.records[0].params.len(), 1);
+        assert_eq!(batch.records[0].params[0].to_string(), "张三");
+        assert_eq!(batch.records[1].params[0].to_string(), "李四");
     }
-}
+
+    #[test]
+    fn test_extract_emoji_and_special() {
+        let logs = vec![
+            make_log(0, "🎉 Party at 2026-05-15 with 🎂"),
+            make_log(1, "🎉 Party at 2026-05-16 with 🎁"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        assert_eq!(batch.templates.len(), 1);
+        assert_eq!(batch.records.len(), 2);
+        assert!(batch.records[0].params.len() >= 1);
+    }
+
+    #[test]
+    fn test_extract_very_long_message() {
+        let long_base = "a".repeat(4096);
+        let logs = vec![
+            make_log(0, &format!("{} {}", long_base, "suffix1")),
+            make_log(1, &format!("{} {}", long_base, "suffix2")),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        assert_eq!(batch.templates.len(), 1);
+        assert_eq!(batch.records.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_no_common_pattern() {
+        let logs = vec![
+            make_log(0, "Alpha beta gamma"),
+            make_log(1, "One two three four"),
+            make_log(2, "Xyzzy plugh plover"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        assert!(batch.templates.len() >= 1);
+        assert_eq!(batch.records.len(), 3);
+    }
+
+    #[test]
+    fn test_xor_param_length_mismatch() {
+        let base = "short";
+        let curr = "this is a much longer string with many characters";
+        let encoded = TemplateExtractor::xor_param_bytes(curr.as_bytes(), base.as_bytes());
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base.as_bytes());
+        assert_eq!(decoded, curr.as_bytes());
+    }
+
+    #[test]
+    fn test_xor_param_base_longer_than_curr() {
+        let base = "this is the long base string for testing";
+        let curr = "tiny";
+        let encoded = TemplateExtractor::xor_param_bytes(curr.as_bytes(), base.as_bytes());
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base.as_bytes());
+        assert_eq!(decoded, curr.as_bytes());
+    }
+
+    #[test]
+    fn test_xor_param_empty_string() {
+        let base = "nonempty";
+        let curr = "";
+        let encoded = TemplateExtractor::xor_param_bytes(curr.as_bytes(), base.as_bytes());
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base.as_bytes());
+        assert_eq!(decoded, curr.as_bytes());
+    }
+
+    #[test]
+    fn test_xor_param_exactly_8_bytes() {
+        let base = b"12345678";
+        let curr = b"abcdefgh";
+        let encoded = TemplateExtractor::xor_param_bytes(curr, base);
+        let chunks = u16::from_le_bytes([encoded[0], encoded[1]]);
+        assert_eq!(chunks, 1);
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base);
+        assert_eq!(decoded, curr);
+    }
+
+    #[test]
+    fn test_xor_param_exactly_16_bytes() {
+        let base = b"1234567890123456";
+        let curr = b"abcdefghijklmnop";
+        let encoded = TemplateExtractor::xor_param_bytes(curr, base);
+        let chunks = u16::from_le_bytes([encoded[0], encoded[1]]);
+        assert_eq!(chunks, 2);
+        let (decoded, _) = TemplateExtractor::decode_xor_param_bytes(&encoded, base);
+        assert_eq!(decoded, curr);
+    }
+
+    #[test]
+    fn test_encode_xor_empty_params() {
+        let logs = vec![
+            make_log(0, "No params here"),
+            make_log(1, "No params here"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        let encoded = TemplateExtractor::encode_xor(&batch, 16);
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].param_encoding.data.len(), 4); // 仅 u32 param_count = 0
+    }
+
+    #[test]
+    fn test_template_batch_pattern_table_roundtrip() {
+        let logs = vec![
+            make_log(0, "User 12345 logged in from 192.168.1.1"),
+            make_log(1, "User 67890 logged in from 192.168.1.2"),
+            make_log(2, "Query SELECT * FROM users executed in 45ms"),
+            make_log(3, "Query SELECT * FROM orders executed in 120ms"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+        let table = batch.serialize_pattern_table();
+        let templates = TemplateBatch::deserialize_pattern_table(&table).unwrap();
+
+        assert_eq!(templates.len(), batch.templates.len());
+        for (a, b) in batch.templates.iter().zip(templates.iter()) {
+            assert_eq!(a.parts.len(), b.parts.len());
+            for (pa, pb) in a.parts.iter().zip(b.parts.iter()) {
+                assert_eq!(pa, pb);
+            }
+        }
+    }
+
+    #[test]
+    fn test_template_deserialize_error_truncated() {
+        let bad_data = vec![0x01, 0x00]; // 声称 1 个 part，但无后续数据
+        let result = Template::deserialize(&bad_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_template_deserialize_error_unknown_tag() {
+        let mut buf = vec![0x01, 0x00]; // 1 part
+        buf.push(0x99); // 未知 tag
+        let result = Template::deserialize(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_u64_le_bounds() {
+        let bytes = b"hello";
+        assert_eq!(TemplateExtractor::read_u64_le(bytes, 0, 5), 0x6f6c6c6568);
+        assert_eq!(TemplateExtractor::read_u64_le(bytes, 10, 5), 0);
+        assert_eq!(TemplateExtractor::read_u64_le(bytes, 3, 5), 0x6f6c);
+    }
+
+    #[test]
+    fn test_tokenize_various() {
+        let cases = vec![
+            ("simple", vec!["simple"]),
+            ("two words", vec!["two", " ", "words"]),
+            ("a,b.c", vec!["a", ",", "b.c"]),
+            ("num123_456", vec!["num123_456"]),
+        ];
+        for (input, expected) in cases {
+            let tokens = TemplateExtractor::tokenize(input);
+            assert_eq!(tokens, expected.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        }
+    }
 }
 
 // ==================== PatternTable 序列化（供 storage.rs 使用）====================

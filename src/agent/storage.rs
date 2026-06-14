@@ -16,7 +16,7 @@
 //!     -> 仅对命中 Chunk 解压、XOR-P 还原、逐行匹配
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use crate::agent::compressor::{Compressor, CompressorConfig};
 use crate::agent::index::Index;
 use crate::agent::template::{
-    EncodedRecord, TemplateBatch, TemplateExtractor, TemplatePart,
+    EncodedRecord, ParamEncoding, TemplateBatch, TemplateExtractor, TemplatePart, TypedParam,
 };
 use crate::shared::format::{
     align_up, crc32, padding_needed, segment_name, ChunkEntry, ChunkSummary, LogLine,
@@ -41,6 +41,16 @@ pub struct StorageConfig {
     pub compression_level: i32,
     pub chunk_size: usize, // 新增：每 Chunk 行数，默认 256
     pub dict: Option<Vec<u8>>,
+    /// 小数据量阈值：行数不超过该值时使用单 Chunk Segment，
+    /// 让 zstd 滑动窗口覆盖全部数据，提高压缩比。
+    pub single_chunk_threshold_lines: usize,
+    /// 小数据量阈值：消息总字节数不超过该值时使用单 Chunk Segment。
+    pub single_chunk_threshold_bytes: usize,
+    /// 训练 Segment 级 zstd 字典所需的最少 Chunk 数。
+    /// 只有多 Chunk 且 Chunk 数 >= 该值时才训练字典，单 Chunk 场景无需字典。
+    pub dict_training_min_chunks: usize,
+    /// 训练字典时使用的样本 Chunk 数。
+    pub dict_training_sample_chunks: usize,
 }
 
 impl Default for StorageConfig {
@@ -51,6 +61,12 @@ impl Default for StorageConfig {
             compression_level: 3,
             chunk_size: 256,
             dict: None,
+            single_chunk_threshold_lines: 10_000,
+            single_chunk_threshold_bytes: 5 * 1024 * 1024,
+            // 默认禁用 Segment 级字典：对高度模板化日志收益有限，
+            // 且训练/存储字典会带来额外开销。需要时显式调小。
+            dict_training_min_chunks: usize::MAX,
+            dict_training_sample_chunks: 8,
         }
     }
 }
@@ -328,13 +344,21 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
         let batch = TemplateExtractor::extract(logs);
 
         // 2. 按 chunk_size 切分 Chunk
-        let chunk_size = self.config.chunk_size;
+        // 小数据量时使用单 Chunk，让 zstd 覆盖全部数据，提升压缩比。
+        let total_msg_bytes: usize = logs.iter().map(|l| l.message.len()).sum();
+        let use_single_chunk = logs.len() <= self.config.single_chunk_threshold_lines
+            && total_msg_bytes <= self.config.single_chunk_threshold_bytes;
+        let chunk_size = if use_single_chunk {
+            logs.len().max(1)
+        } else {
+            self.config.chunk_size
+        };
         let num_chunks = (logs.len() + chunk_size - 1) / chunk_size;
-        let mut chunk_entries = Vec::with_capacity(num_chunks);
+
+        // 2. 准备 Chunk：计算摘要、XOR-P 编码、序列化（暂不压缩）
+        let mut chunk_entries: Vec<ChunkEntry> = Vec::with_capacity(num_chunks);
         let mut chunk_summaries = Vec::with_capacity(num_chunks);
-        let mut chunk_data_parts = Vec::with_capacity(num_chunks);
-        let mut total_compressed = 0usize;
-        let mut total_original = 0usize;
+        let mut chunk_binaries: Vec<Vec<u8>> = Vec::with_capacity(num_chunks);
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * chunk_size;
@@ -378,25 +402,33 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
 
             // 2b. XOR-P 编码（Chunk 内首行存原始，后续引用 Chunk 首行）
             let chunk_records = &batch.records[start..end];
-            let mut ref_params: Vec<String> = Vec::new();
+            let mut ref_params: Vec<TypedParam> = Vec::new();
+            let mut last_ref_idx: usize = 0;
             let mut encoded_records = Vec::with_capacity(chunk_records.len());
 
             for (i, rec) in chunk_records.iter().enumerate() {
                 let mut encoding_data = Vec::new();
                 encoding_data.extend_from_slice(&(rec.params.len() as u32).to_le_bytes());
 
-                if i == 0 {
-                    // Chunk 首行：存原始参数
+                // 当参数数量或类型与参考行不一致时，当前行必须作为新的参考行
+                let need_new_ref = i == 0
+                    || rec.params.len() != ref_params.len()
+                    || rec.params.iter().zip(ref_params.iter()).any(|(a, b)| a.ty != b.ty);
+
+                if need_new_ref {
+                    // 参考行：直接存储强类型二进制
                     ref_params = rec.params.clone();
+                    last_ref_idx = i;
                     for p in &rec.params {
-                        let bytes = p.as_bytes();
-                        encoding_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                        encoding_data.extend_from_slice(bytes);
+                        encoding_data.push(p.ty as u8);
+                        encoding_data.extend_from_slice(&(p.bytes.len() as u32).to_le_bytes());
+                        encoding_data.extend_from_slice(&p.bytes);
                     }
                 } else {
-                    // 后续行：XOR-P 编码，参考 Chunk 首行
+                    // 非参考行：XOR-P 编码（在强类型二进制上执行）
                     for (p, base) in rec.params.iter().zip(ref_params.iter()) {
-                        let encoded = TemplateExtractor::xor_param_64bit(p, base);
+                        encoding_data.push(p.ty as u8);
+                        let encoded = TemplateExtractor::xor_param_bytes(&p.bytes, &base.bytes);
                         encoding_data.extend_from_slice(&encoded);
                     }
                 }
@@ -407,40 +439,69 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                     level: rec.level.clone(),
                     pat_id: rec.pat_id,
                     param_encoding: crate::agent::template::ParamEncoding {
-                        ref_idx: i as u16,
+                        ref_idx: (i - last_ref_idx) as u16,
                         data: encoding_data,
                     },
                 });
             }
 
-            // 2c. 序列化 Chunk 二进制并压缩
+            // 2c. 序列化 Chunk 二进制（先不压缩，用于后续字典训练）
             let chunk_binary = self.serialize_chunk_binary(&encoded_records, chunk_logs);
-            // 直接用 Zstd 压缩 chunk_binary
-            let compressed = zstd::encode_all(&chunk_binary[..], self.config.compression_level)?;
-
-            let original_sz = chunk_binary.len();
-            let compressed_sz = compressed.len();
-            total_original += original_sz;
-            total_compressed += compressed_sz;
-
             chunk_entries.push(ChunkEntry::new(
-                0, // offset 稍后计算
-                compressed_sz as u32,
-                original_sz as u32,
+                0, // offset 与 compressed/original sz 稍后回填
+                0,
+                0,
                 chunk_logs.len() as u32,
                 chunk_logs.first().map(|l| l.ts).unwrap_or(0),
                 chunk_logs.last().map(|l| l.ts).unwrap_or(0),
             ));
+            chunk_binaries.push(chunk_binary);
+        }
+
+        // 3. 训练 Segment 级 zstd 共享字典
+        // 多 Chunk 场景下，字典能捕捉跨 Chunk 的公共模板模式，提升压缩率。
+        let segment_dict = if num_chunks >= self.config.dict_training_min_chunks {
+            Self::train_segment_dict(&chunk_binaries, self.config.dict_training_sample_chunks)
+        } else {
+            None
+        };
+
+        // 4. 压缩 Chunk（使用 Segment 级字典）
+        let mut chunk_data_parts = Vec::with_capacity(num_chunks);
+        let mut total_compressed = 0usize;
+        let mut total_original = 0usize;
+        for (i, binary) in chunk_binaries.iter().enumerate() {
+            let compressed = Self::compress_with_dict(
+                binary,
+                self.config.compression_level,
+                segment_dict.as_deref(),
+            )?;
+            let original_sz = binary.len();
+            let compressed_sz = compressed.len();
+            total_original += original_sz;
+            total_compressed += compressed_sz;
+
+            chunk_entries[i].compressed_sz = compressed_sz as u32;
+            chunk_entries[i].original_sz = original_sz as u32;
             chunk_data_parts.push(compressed);
         }
 
-        // 3. 组装 Segment 文件
+        // 5. 组装 Segment 文件
         let pattern_table = batch.serialize_pattern_table();
         let pattern_count = batch.templates.len() as u16;
         let pattern_table_len = pattern_table.len() as u32;
 
-        // 计算各区域偏移（v2: Header + PatternTable + ChunkTable + SummaryTable + Padding + Data）
-        let table_start = SEGMENT_HEADER_SIZE + pattern_table.len();
+        // 字典区放在 PatternTable 之后、ChunkTable 之前
+        let dict_bytes = segment_dict.unwrap_or_default();
+        let dict_len = dict_bytes.len() as u32;
+        let dict_offset_val = if dict_len > 0 {
+            (SEGMENT_HEADER_SIZE + pattern_table.len()) as u32
+        } else {
+            0
+        };
+
+        // 计算各区域偏移（v2: Header + PatternTable + [Dict] + ChunkTable + SummaryTable + Padding + Data）
+        let table_start = SEGMENT_HEADER_SIZE + pattern_table.len() + dict_bytes.len();
         let summary_start = table_start + num_chunks * CHUNK_ENTRY_SIZE;
         let data_offset_val = align_up(summary_start + num_chunks * CHUNK_SUMMARY_SIZE, ALIGNMENT);
 
@@ -458,12 +519,17 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             pattern_table_len,
             summary_start as u32,
             data_offset_val as u32,
+            dict_offset_val,
+            dict_len,
         );
 
         // 组装内容
         let mut content = Vec::new();
         content.extend_from_slice(&header.to_bytes());
         content.extend_from_slice(&pattern_table);
+        if dict_len > 0 {
+            content.extend_from_slice(&dict_bytes);
+        }
         for entry in &chunk_entries {
             content.extend_from_slice(&entry.to_bytes());
         }
@@ -540,11 +606,70 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             buf.extend_from_slice(svc_bytes);
             buf.push(rec.level.as_bytes()[0]);
             buf.extend_from_slice(&rec.pat_id.to_le_bytes());
-            // 参数编码数据
+            // 参数编码数据（ref_idx + data_len + data）
+            buf.extend_from_slice(&rec.param_encoding.ref_idx.to_le_bytes());
             buf.extend_from_slice(&(rec.param_encoding.data.len() as u32).to_le_bytes());
             buf.extend_from_slice(&rec.param_encoding.data);
         }
         buf
+    }
+
+    /// 训练 Segment 级 zstd 字典
+    ///
+    /// 从样本 Chunk 二进制数据中学习公共模式，供后续所有 Chunk 共享。
+    /// 返回 None 表示样本不足或训练失败（回退到无字典）。
+    fn train_segment_dict(chunk_binaries: &[Vec<u8>], sample_chunks: usize) -> Option<Vec<u8>> {
+        if chunk_binaries.len() < 2 {
+            return None;
+        }
+        let samples: Vec<Vec<u8>> = chunk_binaries
+            .iter()
+            .take(sample_chunks)
+            .cloned()
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
+        let total_len: usize = samples.iter().map(|s| s.len()).sum();
+        let avg_len = total_len / samples.len();
+        // 字典大小上限：平均样本大小的 2 倍、总样本的 1/20、16KB、110KB 四者取最小，
+        // 避免小数据量时字典本身成为主要开销。
+        let max_dict_size = (avg_len * 2)
+            .min(total_len / 20)
+            .min(16 * 1024)
+            .min(110 * 1024)
+            .max(1024);
+        match zstd::dict::from_samples(&samples, max_dict_size) {
+            Ok(dict) if !dict.is_empty() => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// 使用可选字典压缩数据
+    fn compress_with_dict(
+        data: &[u8],
+        level: i32,
+        dict: Option<&[u8]>,
+    ) -> io::Result<Vec<u8>> {
+        if let Some(d) = dict {
+            let mut enc = zstd::stream::write::Encoder::with_dictionary(Vec::new(), level, d)?;
+            enc.write_all(data)?;
+            enc.finish()
+        } else {
+            zstd::encode_all(data, level)
+        }
+    }
+
+    /// 使用可选字典解压数据
+    fn decompress_with_dict(data: &[u8], dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
+        if let Some(d) = dict {
+            let mut dec = zstd::stream::read::Decoder::with_dictionary(data, d)?;
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out)?;
+            Ok(out)
+        } else {
+            zstd::decode_all(data)
+        }
     }
 
     // ---------- 私有：Segment 查询 ----------
@@ -667,6 +792,15 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             Vec::new()
         };
 
+        // 1.5 读取 Segment 级 zstd 字典（如果存在）
+        let dict_offset = header.dict_offset() as usize;
+        let dict_len = header.dict_len() as usize;
+        let segment_dict = if dict_len > 0 && dict_offset >= pattern_table_end && dict_offset + dict_len <= mmap.len() - SEGMENT_FOOTER_SIZE {
+            Some(&mmap[dict_offset..dict_offset + dict_len])
+        } else {
+            None
+        };
+
         let mut keyword_pats: Vec<u16> = Vec::new();
         for (i, t) in templates.iter().enumerate() {
             for part in &t.parts {
@@ -679,8 +813,8 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             }
         }
 
-        // 2. 读取 ChunkTable
-        let table_start = SEGMENT_HEADER_SIZE + pattern_table_len;
+        // 2. 读取 ChunkTable（在 PatternTable 和可选 Dict 之后）
+        let table_start = SEGMENT_HEADER_SIZE + pattern_table_len + dict_len;
         let mut chunks = Vec::with_capacity(chunk_count);
         for i in 0..chunk_count {
             let off = table_start + i * CHUNK_ENTRY_SIZE;
@@ -751,8 +885,8 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             }
             let compressed = &mmap[data_start..data_end];
 
-            // 解压 Chunk 二进制
-            let chunk_binary = zstd::decode_all(compressed)
+            // 解压 Chunk 二进制（使用 Segment 级字典）
+            let chunk_binary = Self::decompress_with_dict(compressed, segment_dict)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             
             // 解析并还原 XOR-P
@@ -783,10 +917,10 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
     ) -> io::Result<Vec<LogLine>> {
         let mut logs = Vec::new();
         let mut offset = 0;
-        let mut ref_params: Vec<String> = Vec::new();
+        let mut ref_params: Vec<TypedParam> = Vec::new();
 
         while offset < data.len() {
-            // 读取 ts_delta
+            // 读取 ts
             if offset + 8 > data.len() {
                 break;
             }
@@ -818,6 +952,10 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             let pat_id = u16::from_le_bytes([data[offset], data[offset+1]]);
             offset += 2;
 
+            if offset + 2 > data.len() { break; }
+            let ref_idx = u16::from_le_bytes([data[offset], data[offset+1]]);
+            offset += 2;
+
             if offset + 4 > data.len() { break; }
             let enc_len = u32::from_le_bytes([
                 data[offset], data[offset+1], data[offset+2], data[offset+3],
@@ -828,40 +966,20 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             let enc_data = &data[offset..offset+enc_len];
             offset += enc_len;
 
-            // 解析参数编码
-            if enc_data.len() < 4 {
-                logs.push(LogLine { ts, service, level: level.to_string(), message: "".to_string() });
-                continue;
-            }
-            let param_count = u32::from_le_bytes([enc_data[0], enc_data[1], enc_data[2], enc_data[3]]) as usize;
-            let mut params = Vec::with_capacity(param_count);
-
-            if param_count > 0 && enc_data.len() > 8 {
-                // 检查是否是原始参数（Chunk 首行）或 XOR-P
-                let second_len = u32::from_le_bytes([enc_data[4], enc_data[5], enc_data[6], enc_data[7]]) as usize;
-                let is_raw = second_len <= 256 && enc_data.len() >= 8 + second_len;
-
-                if is_raw && ref_params.is_empty() {
-                    // Chunk 首行：原始参数
-                    let mut p_offset = 4;
-                    for _ in 0..param_count {
-                        let len = u32::from_le_bytes([enc_data[p_offset], enc_data[p_offset+1], enc_data[p_offset+2], enc_data[p_offset+3]]) as usize;
-                        p_offset += 4;
-                        let s = String::from_utf8_lossy(&enc_data[p_offset..p_offset+len]).to_string();
-                        p_offset += len;
-                        params.push(s);
-                    }
-                    ref_params = params.clone();
-                } else {
-                    // XOR-P 解码
-                    let mut p_offset = 4;
-                    for i in 0..param_count {
-                        let base = ref_params.get(i).map(|s| s.as_str()).unwrap_or("");
-                        let (param, consumed) = TemplateExtractor::decode_xor_param_64bit(&enc_data[p_offset..], base);
-                        params.push(param);
-                        p_offset += consumed;
-                    }
-                }
+            // 使用 TemplateExtractor::decode_xor 解码强类型参数
+            let enc_rec = EncodedRecord {
+                ts_delta: 0,
+                svc_id: 0,
+                level: level.to_string(),
+                pat_id,
+                param_encoding: ParamEncoding {
+                    ref_idx,
+                    data: enc_data.to_vec(),
+                },
+            };
+            let params = TemplateExtractor::decode_xor(&enc_rec, &ref_params);
+            if ref_idx == 0 {
+                ref_params = params.clone();
             }
 
             // 重建 message
@@ -874,7 +992,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                         TemplatePart::Literal(s) => msg.push_str(s),
                         TemplatePart::Param => {
                             if let Some(p) = params.get(param_idx) {
-                                msg.push_str(p);
+                                msg.push_str(&p.to_string());
                                 param_idx += 1;
                             } else {
                                 msg.push('*');
@@ -884,12 +1002,9 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                 }
                 msg
             } else {
-                params.join(" ")
+                params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
             };
 
-            // 重建 LogLine（ts 需要累积，但简化：用原始 batch 的 ts）
-            // 注意：这里丢失了原始 ts，因为 Chunk 二进制只存了 ts_delta
-            // 需要在 Chunk 首行存绝对 ts，或外部传入。简化：存绝对 ts 在 Chunk 首行。
             logs.push(LogLine {
                 ts,
                 service,

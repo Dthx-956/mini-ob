@@ -58,11 +58,15 @@ fn test_windows_2k_compression_vs_pure_zstd() {
     let storage = StorageEngine::open(
         &data_dir,
         StorageConfig {
-            max_buffer_lines: 1000,
-            max_buffer_bytes: 64 * 1024,
+            max_buffer_lines: 10_000,
+            max_buffer_bytes: 5 * 1024 * 1024,
             compression_level: 3,
             chunk_size: 256,
             dict: None,
+            single_chunk_threshold_lines: 10_000,
+            single_chunk_threshold_bytes: 5 * 1024 * 1024,
+            dict_training_min_chunks: 4,
+            dict_training_sample_chunks: 8,
         },
     )
     .expect("打开 StorageEngine 失败");
@@ -158,10 +162,10 @@ fn test_windows_2k_compression_vs_pure_zstd() {
 
     // 纯 zstd 是全局一次性压缩，Mini-OBS 为了支持按 Chunk 查询会把数据切分并保留
     // PatternTable/ChunkSummary 等元数据，因此通常会比纯 zstd 大一些。
-    // 这里要求 Mini-OBS 至少达到纯 zstd 效果的 15%，同时保证绝对压缩比不低于 2x，
-    // 即可证明模板提取+二进制格式真实有效（而非退化为原始 JSON 包装）。
+    // 启用单 Chunk Segment 后，小数据量下 zstd 滑动窗口覆盖全部数据，
+    // 要求 Mini-OBS 至少达到纯 zstd 效果的 35%，即可证明元数据设计有效。
     assert!(
-        mini_obs_ratio >= pure_zstd_ratio * 0.15,
+        mini_obs_ratio >= pure_zstd_ratio * 0.35,
         "Mini-OBS 压缩比 ({:.2}x) 远低于纯 zstd ({:.2}x)，预处理效果不明显",
         mini_obs_ratio,
         pure_zstd_ratio
@@ -192,4 +196,88 @@ fn test_windows_2k_compression_vs_pure_zstd() {
     let err_count = results.iter().filter(|l| l.level == "E").count();
     assert!(info_count > 0, "应至少包含部分 INFO 级别日志");
     println!("级别分布: I={}, W={}, E={}", info_count, warn_count, err_count);
+}
+
+/// 验证 Segment 级 zstd 共享字典的写入/读取/查询路径可正常工作。
+///
+/// 说明：对高度模板化日志，模板提取已经去除大部分冗余，字典增益不明显；
+/// 此测试主要确保当启用字典时，Segment 能正确存储字典并在查询时用其解压。
+#[test]
+fn test_segment_dictionary_roundtrip() {
+    use mini_obs::shared::format::LogLine;
+
+    let lines = 2000;
+    // 故意使用非高度模板化、但含大量公共子串的数据，给字典留下发挥空间
+    let logs: Vec<LogLine> = (0..lines)
+        .map(|i| LogLine {
+            ts: 1000 + i as u64 * 100,
+            service: "windows".to_string(),
+            level: if i % 10 == 0 { "E" } else { "I" }.to_string(),
+            message: format!(
+                "Service Control Manager: The {} service entered the {} state on host {} pid={}",
+                ["Spooler", "Themes", "WSearch", "WinDefend"][i % 4],
+                ["running", "stopped", "paused"][i % 3],
+                format!("host-{:04}", i % 50),
+                i
+            ),
+        })
+        .collect();
+
+    let dir = temp_dir("mini-obs-dict-roundtrip");
+    let storage = StorageEngine::open(
+        &dir,
+        StorageConfig {
+            max_buffer_lines: 10_000,
+            max_buffer_bytes: 10 * 1024 * 1024,
+            compression_level: 3,
+            chunk_size: 256,
+            dict: None,
+            // 强制多 Chunk：单 Chunk 阈值小于日志行数，使字典有机会训练
+            single_chunk_threshold_lines: 100,
+            single_chunk_threshold_bytes: 10 * 1024 * 1024,
+            dict_training_min_chunks: 4,
+            dict_training_sample_chunks: 8,
+        },
+    )
+    .unwrap();
+
+    for log in &logs {
+        storage.append(log.clone()).unwrap();
+    }
+    storage.flush().unwrap();
+
+    let stats = storage.stats();
+    println!(
+        "dict roundtrip: segments={}, total_lines={}, compressed={}",
+        stats.segment_count, stats.total_lines, stats.total_compressed_bytes
+    );
+
+    // 确认 segment 头记录了字典信息
+    let mut found_dict = false;
+    for entry in std::fs::read_dir(dir.join("segments")).unwrap() {
+        let path = entry.unwrap().path();
+        let buf = std::fs::read(&path).unwrap();
+        if let Ok(parsed) = mini_obs::shared::format::ParsedSegment::parse(&buf) {
+            let h = &parsed.header;
+            println!(
+                "  segment {}: chunks={}, dict_offset={}, dict_len={}",
+                h.segment_id,
+                h.chunk_count,
+                h.dict_offset(),
+                h.dict_len()
+            );
+            if h.dict_len() > 0 {
+                found_dict = true;
+            }
+        }
+    }
+    assert!(found_dict, "应训练出 Segment 级字典");
+
+    // 查询验证完整性：用字典解压后数据正确
+    let results = storage.query(0, u64::MAX, "", lines).unwrap();
+    assert_eq!(results.len(), lines, "查询行数不匹配");
+
+    // 验证部分 message 内容正确还原
+    assert!(results.iter().any(|l| l.message.contains("Spooler")));
+    assert!(results.iter().any(|l| l.message.contains("WinDefend")));
 }

@@ -276,11 +276,15 @@ impl SegmentHeader {
         pattern_table_len: u32,
         summary_offset: u32,
         data_offset: u32,
+        dict_offset: u32,
+        dict_len: u32,
     ) {
         self.reserved[0..2].copy_from_slice(&pattern_count.to_le_bytes());
         self.reserved[2..6].copy_from_slice(&pattern_table_len.to_le_bytes());
         self.reserved[6..10].copy_from_slice(&summary_offset.to_le_bytes());
         self.reserved[10..14].copy_from_slice(&data_offset.to_le_bytes());
+        self.reserved[14..18].copy_from_slice(&dict_offset.to_le_bytes());
+        self.reserved[18..22].copy_from_slice(&dict_len.to_le_bytes());
         // 重新计算 CRC（因为 version 等未变，只有 reserved 变了，而 CRC 不覆盖 reserved）
         // 注意：header_crc32 只覆盖 0x00..0x13，不包括 reserved，所以无需重算
     }
@@ -306,6 +310,20 @@ impl SegmentHeader {
     pub fn data_offset_v2(&self) -> u32 {
         u32::from_le_bytes([
             self.reserved[10], self.reserved[11], self.reserved[12], self.reserved[13],
+        ])
+    }
+
+    /// v2：zstd 字典偏移（相对文件头，0 表示无字典）
+    pub fn dict_offset(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[14], self.reserved[15], self.reserved[16], self.reserved[17],
+        ])
+    }
+
+    /// v2：zstd 字典长度（0 表示无字典）
+    pub fn dict_len(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[18], self.reserved[19], self.reserved[20], self.reserved[21],
         ])
     }
 
@@ -854,8 +872,9 @@ impl ParsedSegment {
         let header = SegmentHeader::from_bytes(&buf[0..SEGMENT_HEADER_SIZE])?;
         let chunk_count = header.chunk_count as usize;
 
-        // 解析 ChunkTable（v2 时 PatternTable 在 Header 和 ChunkTable 之间）
-        let table_start = SEGMENT_HEADER_SIZE + header.pattern_table_len() as usize;
+        // 解析 ChunkTable（v2 时 PatternTable + 可选 Dict 在 Header 和 ChunkTable 之间）
+        let dict_len = header.dict_len() as usize;
+        let table_start = SEGMENT_HEADER_SIZE + header.pattern_table_len() as usize + dict_len;
         let table_end = table_start + chunk_count * CHUNK_ENTRY_SIZE;
         if buf.len() < table_end + SEGMENT_FOOTER_SIZE {
             return Err(FormatError::UnexpectedEof {
@@ -1062,13 +1081,15 @@ mod tests {
     #[test]
     fn test_segment_header_v2_roundtrip() {
         let mut h = SegmentHeader::new(42, 3);
-        h.set_v2_meta(5, 128, 256, 4096);
+        h.set_v2_meta(5, 128, 256, 4096, 8192, 1024);
         let bytes = h.to_bytes();
         assert_eq!(bytes.len(), 64);
         let h2 = SegmentHeader::from_bytes(&bytes).unwrap();
         assert_eq!(h2.version, FORMAT_VERSION_V2);
         assert_eq!(h2.pattern_count(), 5);
         assert_eq!(h2.pattern_table_len(), 128);
+        assert_eq!(h2.dict_offset(), 8192);
+        assert_eq!(h2.dict_len(), 1024);
         assert_eq!(h2.summary_offset(), 256);
         assert_eq!(h2.data_offset_v2(), 4096);
     }
@@ -1132,7 +1153,7 @@ mod tests {
         let summary_start = table_start + CHUNK_ENTRY_SIZE;
         let data_offset = align_up(summary_start + CHUNK_SUMMARY_SIZE, ALIGNMENT) as u32;
 
-        header.set_v2_meta(1, pattern_table.len() as u32, summary_start as u32, data_offset);
+        header.set_v2_meta(1, pattern_table.len() as u32, summary_start as u32, data_offset, 0, 0);
 
         let mut content = Vec::new();
         content.extend_from_slice(&header.to_bytes());

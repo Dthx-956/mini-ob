@@ -8,7 +8,7 @@
 //! - 多格式兼容：支持标准 JSON 日志 + 本系统紧凑格式 (t/s/l/m) + 原始行降级
 //! - 跨平台：纯 Rust 标准库 + serde_json，无系统特定依赖
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -292,7 +292,7 @@ fn collect_mock(
 ///    和紧凑字段（t/s/l/m）
 /// 2. Nginx/Apache 格式：简单启发式提取
 /// 3. 降级：原始整行作为 message，自动推断 level
-fn parse_line(line: &str, default_service: &str) -> Option<LogLine> {
+pub fn parse_line(line: &str, default_service: &str) -> Option<LogLine> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -730,7 +730,7 @@ fn test_file_tail_collection() {
     // 追加新行
     std::thread::sleep(Duration::from_millis(100));
     {
-        let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
         writeln!(file, r#"{{"t":2000,"s":"svc","l":"W","m":"second"}}"#).unwrap();
         writeln!(file, r#"{{"t":3000,"s":"svc","l":"E","m":"third"}}"#).unwrap();
     }

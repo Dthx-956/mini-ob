@@ -174,7 +174,7 @@ impl Compressor {
 
         let mut logs = Vec::with_capacity(rec_count);
         let mut prev_ts: u64 = 0;
-        let mut ref_params: Vec<String> = Vec::new();
+        let mut ref_params: Vec<crate::agent::template::TypedParam> = Vec::new();
 
         for rec_idx in 0..rec_count {
             check(offset, 8)?;
@@ -245,7 +245,7 @@ impl Compressor {
                     TemplatePart::Literal(s) => msg_parts.push(s.clone()),
                     TemplatePart::Param => {
                         if let Some(p) = param_iter.next() {
-                            msg_parts.push(p.clone());
+                            msg_parts.push(p.to_string());
                         }
                     }
                 }
