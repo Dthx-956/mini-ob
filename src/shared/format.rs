@@ -220,9 +220,15 @@ pub fn now_ms() -> u64 {
 /// 0x1A-0x1D  pattern_table_len:  u32 LE  = PatternTable 字节数
 /// 0x1C-0x1F  summary_offset:     u32 LE  = ChunkSummaryTable 起始偏移
 /// 0x20-0x23  data_offset:        u32 LE  = ChunkData 起始偏移
-/// 0x24-0x3F  reserved:           [u8; 28] = 保留
+/// 0x24-0x37  reserved:           [u8; 20] = 保留
+/// 0x38       feature_flags:      u8       = Chunk 编码特性标志
+/// 0x39-0x3F  reserved:           [u8; 7]  = 保留
 /// ```
 /// v1 时 reserved 全为 0，上述字段返回 0。
+///
+/// Feature flags（v2）：
+/// - bit 0 (`FEATURE_ENHANCED_CHUNK`)：使用增强 Chunk 二进制编码
+///   （timestamp delta RLE + level 位图 + service 表去重）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SegmentHeader {
@@ -325,6 +331,17 @@ impl SegmentHeader {
         u32::from_le_bytes([
             self.reserved[18], self.reserved[19], self.reserved[20], self.reserved[21],
         ])
+    }
+
+    /// v2：Chunk 编码特性标志
+    pub const FEATURE_ENHANCED_CHUNK: u8 = 0x01;
+
+    pub fn feature_flags(&self) -> u8 {
+        self.reserved[22]
+    }
+
+    pub fn set_feature_flags(&mut self, flags: u8) {
+        self.reserved[22] = flags;
     }
 
     /// 从字节切片解析（零拷贝，不复制）

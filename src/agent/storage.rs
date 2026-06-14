@@ -522,6 +522,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             dict_offset_val,
             dict_len,
         );
+        header.set_feature_flags(SegmentHeader::FEATURE_ENHANCED_CHUNK);
 
         // 组装内容
         let mut content = Vec::new();
@@ -595,22 +596,119 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
     }
 
     /// 序列化 Chunk 内的编码记录为二进制（供 Zstd 压缩）
+    ///
+    /// 增强格式（v2 + FEATURE_ENHANCED_CHUNK）：
+    /// - 时间戳：base_ts + delta RLE（常量 delta 或原始数组）
+    /// - Level：2-bit 位图打包
+    /// - Service：去重表 + 每行索引（单 service 时直接共享）
+    /// - 记录：pat_id + ref_idx + 参数编码
     fn serialize_chunk_binary(&self, records: &[EncodedRecord], logs: &[LogLine]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(records.len() * 64);
-        for (i, rec) in records.iter().enumerate() {
-            // 存储绝对时间戳（u64），便于独立解码
-            buf.extend_from_slice(&logs[i].ts.to_le_bytes());
-            // 存储完整 service 字符串（len u16 + bytes）
-            let svc_bytes = logs[i].service.as_bytes();
-            buf.extend_from_slice(&(svc_bytes.len() as u16).to_le_bytes());
-            buf.extend_from_slice(svc_bytes);
-            buf.push(rec.level.as_bytes()[0]);
+        use std::collections::HashMap;
+
+        let n = records.len();
+        assert_eq!(n, logs.len());
+        let mut buf = Vec::with_capacity(n * 32);
+
+        // 1. 时间戳：base_ts + deltas
+        let base_ts = logs.first().map(|l| l.ts).unwrap_or(0);
+        let mut deltas = Vec::with_capacity(n.saturating_sub(1));
+        let mut prev = base_ts as i64;
+        for log in logs.iter().skip(1) {
+            let ts = log.ts as i64;
+            deltas.push(ts - prev);
+            prev = ts;
+        }
+        let constant_delta = if n > 1 && deltas.iter().all(|&d| d == deltas[0]) {
+            Some(deltas[0])
+        } else {
+            None
+        };
+
+        if let Some(d) = constant_delta {
+            buf.push(1u8); // 常量 delta
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.extend_from_slice(&base_ts.to_le_bytes());
+            buf.extend_from_slice(&d.to_le_bytes());
+        } else {
+            buf.push(0u8); // 原始 delta 数组
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.extend_from_slice(&base_ts.to_le_bytes());
+            for d in &deltas {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+
+        // 2. Level 位图：每行 2 bit
+        let bitmap_len = (n + 3) / 4;
+        let mut level_bm = vec![0u8; bitmap_len];
+        for (i, log) in logs.iter().enumerate() {
+            let bits = match log.level.as_str() {
+                "D" => 0u8,
+                "I" => 1u8,
+                "W" => 2u8,
+                "E" => 3u8,
+                _ => 1u8,
+            };
+            level_bm[i / 4] |= bits << ((i % 4) * 2);
+        }
+        buf.extend_from_slice(&level_bm);
+
+        // 3. Service 去重
+        let mut unique: Vec<String> = Vec::new();
+        let mut svc_map: HashMap<String, usize> = HashMap::new();
+        let mut svc_indices: Vec<usize> = Vec::with_capacity(n);
+        for log in logs {
+            if let Some(&idx) = svc_map.get(&log.service) {
+                svc_indices.push(idx);
+            } else {
+                let idx = unique.len();
+                svc_map.insert(log.service.clone(), idx);
+                unique.push(log.service.clone());
+                svc_indices.push(idx);
+            }
+        }
+
+        if unique.len() == 1 {
+            // mode 0：共享单一 service
+            buf.push(0u8);
+            let b = unique[0].as_bytes();
+            buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            buf.extend_from_slice(b);
+        } else if unique.len() <= 255 {
+            // mode 1：每行 u8 索引
+            buf.push(1u8);
+            buf.extend_from_slice(&(unique.len() as u16).to_le_bytes());
+            for svc in &unique {
+                let b = svc.as_bytes();
+                buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            for &idx in &svc_indices {
+                buf.push(idx as u8);
+            }
+        } else {
+            // mode 2：每行 u16 索引
+            buf.push(2u8);
+            buf.extend_from_slice(&(unique.len() as u16).to_le_bytes());
+            for svc in &unique {
+                let b = svc.as_bytes();
+                buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            for &idx in &svc_indices {
+                buf.extend_from_slice(&(idx as u16).to_le_bytes());
+            }
+        }
+
+        // 4. 记录 payload
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        for rec in records {
             buf.extend_from_slice(&rec.pat_id.to_le_bytes());
-            // 参数编码数据（ref_idx + data_len + data）
             buf.extend_from_slice(&rec.param_encoding.ref_idx.to_le_bytes());
             buf.extend_from_slice(&(rec.param_encoding.data.len() as u32).to_le_bytes());
             buf.extend_from_slice(&rec.param_encoding.data);
         }
+
         buf
     }
 
@@ -890,7 +988,8 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             
             // 解析并还原 XOR-P
-            let logs = self.deserialize_chunk_binary(&chunk_binary, &templates)?;
+            let feature_flags = header.feature_flags();
+            let logs = self.deserialize_chunk_binary(&chunk_binary, &templates, feature_flags)?;
             for log in logs {
                 if log.ts >= start && log.ts <= end {
                     let svc_match = log.service.contains(keyword);
@@ -914,16 +1013,77 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
         &self,
         data: &[u8],
         templates: &[crate::agent::template::Template],
+        feature_flags: u8,
+    ) -> io::Result<Vec<LogLine>> {
+        if feature_flags & SegmentHeader::FEATURE_ENHANCED_CHUNK != 0 {
+            self.deserialize_chunk_binary_enhanced(data, templates)
+        } else {
+            self.deserialize_chunk_binary_legacy(data, templates)
+        }
+    }
+
+    fn decode_one_record(
+        &self,
+        pat_id: u16,
+        ref_idx: u16,
+        enc_data: &[u8],
+        templates: &[crate::agent::template::Template],
+        ref_params: &mut Vec<TypedParam>,
+        ts: u64,
+        service: String,
+        level: String,
+    ) -> LogLine {
+        let enc_rec = EncodedRecord {
+            ts_delta: 0,
+            svc_id: 0,
+            level: level.clone(),
+            pat_id,
+            param_encoding: ParamEncoding {
+                ref_idx,
+                data: enc_data.to_vec(),
+            },
+        };
+        let params = TemplateExtractor::decode_xor(&enc_rec, ref_params);
+        if ref_idx == 0 {
+            *ref_params = params.clone();
+        }
+
+        let template = templates.get(pat_id as usize);
+        let message = if let Some(t) = template {
+            let mut msg = String::new();
+            let mut param_idx = 0;
+            for part in &t.parts {
+                match part {
+                    TemplatePart::Literal(s) => msg.push_str(s),
+                    TemplatePart::Param => {
+                        if let Some(p) = params.get(param_idx) {
+                            msg.push_str(&p.to_string());
+                            param_idx += 1;
+                        } else {
+                            msg.push('*');
+                        }
+                    }
+                }
+            }
+            msg
+        } else {
+            params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+        };
+
+        LogLine { ts, service, level, message }
+    }
+
+    fn deserialize_chunk_binary_legacy(
+        &self,
+        data: &[u8],
+        templates: &[crate::agent::template::Template],
     ) -> io::Result<Vec<LogLine>> {
         let mut logs = Vec::new();
         let mut offset = 0;
         let mut ref_params: Vec<TypedParam> = Vec::new();
 
         while offset < data.len() {
-            // 读取 ts
-            if offset + 8 > data.len() {
-                break;
-            }
+            if offset + 8 > data.len() { break; }
             let ts = u64::from_le_bytes([
                 data[offset], data[offset+1], data[offset+2], data[offset+3],
                 data[offset+4], data[offset+5], data[offset+6], data[offset+7],
@@ -941,11 +1101,11 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             let level_byte = data[offset];
             offset += 1;
             let level = match level_byte {
-                b'D' => "D",
-                b'I' => "I",
-                b'W' => "W",
-                b'E' => "E",
-                _ => "I",
+                b'D' => "D".to_string(),
+                b'I' => "I".to_string(),
+                b'W' => "W".to_string(),
+                b'E' => "E".to_string(),
+                _ => "I".to_string(),
             };
 
             if offset + 2 > data.len() { break; }
@@ -966,51 +1126,168 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             let enc_data = &data[offset..offset+enc_len];
             offset += enc_len;
 
-            // 使用 TemplateExtractor::decode_xor 解码强类型参数
-            let enc_rec = EncodedRecord {
-                ts_delta: 0,
-                svc_id: 0,
-                level: level.to_string(),
-                pat_id,
-                param_encoding: ParamEncoding {
-                    ref_idx,
-                    data: enc_data.to_vec(),
-                },
-            };
-            let params = TemplateExtractor::decode_xor(&enc_rec, &ref_params);
-            if ref_idx == 0 {
-                ref_params = params.clone();
-            }
+            logs.push(self.decode_one_record(pat_id, ref_idx, enc_data, templates, &mut ref_params, ts, service, level));
+        }
 
-            // 重建 message
-            let template = templates.get(pat_id as usize);
-            let message = if let Some(t) = template {
-                let mut msg = String::new();
-                let mut param_idx = 0;
-                for part in &t.parts {
-                    match part {
-                        TemplatePart::Literal(s) => msg.push_str(s),
-                        TemplatePart::Param => {
-                            if let Some(p) = params.get(param_idx) {
-                                msg.push_str(&p.to_string());
-                                param_idx += 1;
-                            } else {
-                                msg.push('*');
-                            }
-                        }
-                    }
-                }
-                msg
+        Ok(logs)
+    }
+
+    fn deserialize_chunk_binary_enhanced(
+        &self,
+        data: &[u8],
+        templates: &[crate::agent::template::Template],
+    ) -> io::Result<Vec<LogLine>> {
+        let mut offset = 0;
+        let check = |offset: usize, len: usize| -> io::Result<()> {
+            if offset + len > data.len() {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "enhanced chunk truncated"))
             } else {
-                params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
-            };
+                Ok(())
+            }
+        };
 
-            logs.push(LogLine {
-                ts,
-                service,
-                level: level.to_string(),
-                message,
-            });
+        // 1. timestamps
+        check(offset, 1)?;
+        let ts_type = data[offset];
+        offset += 1;
+        check(offset, 4)?;
+        let rec_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+        offset += 4;
+        check(offset, 8)?;
+        let base_ts = u64::from_le_bytes([
+            data[offset], data[offset+1], data[offset+2], data[offset+3],
+            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+        ]);
+        offset += 8;
+
+        let timestamps: Vec<u64> = match ts_type {
+            1 => {
+                check(offset, 8)?;
+                let delta = i64::from_le_bytes([
+                    data[offset], data[offset+1], data[offset+2], data[offset+3],
+                    data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                ]);
+                offset += 8;
+                (0..rec_count).map(|i| (base_ts as i64 + i as i64 * delta) as u64).collect()
+            }
+            _ => {
+                let mut ts = base_ts as i64;
+                let mut ts_vec = Vec::with_capacity(rec_count);
+                ts_vec.push(base_ts);
+                for _ in 1..rec_count {
+                    check(offset, 8)?;
+                    let d = i64::from_le_bytes([
+                        data[offset], data[offset+1], data[offset+2], data[offset+3],
+                        data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                    ]);
+                    offset += 8;
+                    ts += d;
+                    ts_vec.push(ts as u64);
+                }
+                ts_vec
+            }
+        };
+
+        // 2. level bitmap
+        let level_bm_len = (rec_count + 3) / 4;
+        check(offset, level_bm_len)?;
+        let level_bm = &data[offset..offset + level_bm_len];
+        offset += level_bm_len;
+
+        let level_for = |i: usize| -> String {
+            let bits = (level_bm[i / 4] >> ((i % 4) * 2)) & 0x03;
+            match bits {
+                0 => "D".to_string(),
+                1 => "I".to_string(),
+                2 => "W".to_string(),
+                3 => "E".to_string(),
+                _ => "I".to_string(),
+            }
+        };
+
+        // 3. service table
+        check(offset, 1)?;
+        let svc_mode = data[offset];
+        offset += 1;
+
+        let (services, svc_indices) = match svc_mode {
+            0 => {
+                check(offset, 2)?;
+                let len = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+                offset += 2;
+                check(offset, len)?;
+                let svc = String::from_utf8_lossy(&data[offset..offset+len]).to_string();
+                offset += len;
+                (vec![svc], Vec::new())
+            }
+            1 | 2 => {
+                check(offset, 2)?;
+                let svc_count = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+                offset += 2;
+                let mut svcs = Vec::with_capacity(svc_count);
+                for _ in 0..svc_count {
+                    check(offset, 2)?;
+                    let len = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+                    offset += 2;
+                    check(offset, len)?;
+                    svcs.push(String::from_utf8_lossy(&data[offset..offset+len]).to_string());
+                    offset += len;
+                }
+                if svc_mode == 1 {
+                    check(offset, rec_count)?;
+                    let indices: Vec<usize> = data[offset..offset + rec_count].iter().map(|&b| b as usize).collect();
+                    offset += rec_count;
+                    (svcs, indices)
+                } else {
+                    check(offset, rec_count * 2)?;
+                    let mut indices = Vec::with_capacity(rec_count);
+                    for i in 0..rec_count {
+                        let off = offset + i * 2;
+                        indices.push(u16::from_le_bytes([data[off], data[off+1]]) as usize);
+                    }
+                    offset += rec_count * 2;
+                    (svcs, indices)
+                }
+            }
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown service mode in enhanced chunk"));
+            }
+        };
+
+        let svc_index_for = |i: usize| -> usize {
+            if services.len() == 1 { 0 } else { svc_indices[i] }
+        };
+
+        // 4. records
+        check(offset, 4)?;
+        let stored_rec_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+        offset += 4;
+        if stored_rec_count != rec_count {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "enhanced chunk record count mismatch"));
+        }
+
+        let mut logs = Vec::with_capacity(rec_count);
+        let mut ref_params: Vec<TypedParam> = Vec::new();
+        for i in 0..rec_count {
+            check(offset, 2)?;
+            let pat_id = u16::from_le_bytes([data[offset], data[offset+1]]);
+            offset += 2;
+            check(offset, 2)?;
+            let ref_idx = u16::from_le_bytes([data[offset], data[offset+1]]);
+            offset += 2;
+            check(offset, 4)?;
+            let enc_len = u32::from_le_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+            ]) as usize;
+            offset += 4;
+            check(offset, enc_len)?;
+            let enc_data = &data[offset..offset+enc_len];
+            offset += enc_len;
+
+            let ts = timestamps[i];
+            let service = services[svc_index_for(i)].clone();
+            let level = level_for(i);
+            logs.push(self.decode_one_record(pat_id, ref_idx, enc_data, templates, &mut ref_params, ts, service, level));
         }
 
         Ok(logs)
@@ -1427,5 +1704,95 @@ fn test_segment_file_corruption_graceful() {
     // 查询应返回错误而非 panic
     let result = engine.query(0, u64::MAX, "", 100);
     assert!(result.is_err() || result.unwrap().is_empty());
+}
+
+#[test]
+fn test_enhanced_chunk_binary_timestamp_constant() {
+    let dir = test_dir();
+    let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
+
+    let logs: Vec<LogLine> = (0..10)
+        .map(|i| make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg {}", i)))
+        .collect();
+    let batch = TemplateExtractor::extract(&logs);
+    let records = TemplateExtractor::encode_xor(&batch, 16);
+    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
+    assert_eq!(decoded, logs);
+}
+
+#[test]
+fn test_enhanced_chunk_binary_multiple_services() {
+    let dir = test_dir();
+    let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
+
+    let logs: Vec<LogLine> = (0..6)
+        .map(|i| {
+            let svc = if i % 2 == 0 { "auth" } else { "payment" };
+            make_log(1000 + i as u64, svc, "I", &format!("msg {}", i))
+        })
+        .collect();
+    let batch = TemplateExtractor::extract(&logs);
+    let records = TemplateExtractor::encode_xor(&batch, 16);
+    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
+    assert_eq!(decoded, logs);
+}
+
+#[test]
+fn test_enhanced_chunk_binary_mixed_levels() {
+    let dir = test_dir();
+    let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
+
+    let logs: Vec<LogLine> = (0..8)
+        .map(|i| {
+            let lvl = match i % 4 {
+                0 => "D",
+                1 => "I",
+                2 => "W",
+                _ => "E",
+            };
+            make_log(1000 + i as u64 * 10, "svc", lvl, &format!("msg {}", i))
+        })
+        .collect();
+    let batch = TemplateExtractor::extract(&logs);
+    let records = TemplateExtractor::encode_xor(&batch, 16);
+    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
+    assert_eq!(decoded, logs);
+}
+
+#[test]
+fn test_legacy_chunk_binary_compat() {
+    let dir = test_dir();
+    let engine = StorageEngine::open(&dir, StorageConfig::default()).unwrap();
+
+    let logs = vec![
+        make_log(1000, "svc", "I", "alpha"),
+        make_log(2000, "svc", "W", "beta"),
+        make_log(3000, "svc", "E", "gamma"),
+    ];
+
+    // 手动构造旧版 Chunk 二进制（每条记录独立存储 ts/service/level）
+    let mut binary = Vec::new();
+    for log in &logs {
+        binary.extend_from_slice(&log.ts.to_le_bytes());
+        let svc = log.service.as_bytes();
+        binary.extend_from_slice(&(svc.len() as u16).to_le_bytes());
+        binary.extend_from_slice(svc);
+        binary.push(log.level.as_bytes()[0]);
+        // pat_id + ref_idx + empty param data
+        binary.extend_from_slice(&0u16.to_le_bytes());
+        binary.extend_from_slice(&0u16.to_le_bytes());
+        binary.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    let decoded = engine.deserialize_chunk_binary_legacy(&binary, &[]).unwrap();
+    assert_eq!(decoded.len(), logs.len());
+    for (a, b) in decoded.iter().zip(logs.iter()) {
+        assert_eq!(a.ts, b.ts);
+        assert_eq!(a.service, b.service);
+        assert_eq!(a.level, b.level);
+    }
 }
 }
