@@ -16,7 +16,7 @@ use crate::shared::format::LogLine;
 // ==================== 数据模型 ====================
 
 /// 参数类型：用于将文本参数压缩为强类型二进制
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamType {
     /// 普通字符串，按 UTF-8 原样存储
     String = 0,
@@ -26,6 +26,14 @@ pub enum ParamType {
     Hex = 2,
     /// IPv4 地址（4 bytes）
     IPv4 = 3,
+    /// HDFS 风格 Block ID：blk_<integer>（i64 + 1 byte 前缀标记）
+    BlockId = 4,
+    /// IPv4:Port 组合（4 bytes IP + 2 bytes port）
+    IPv4Port = 5,
+    /// 时间戳分量：YYMMDD / HHMMSS / SSS 等紧凑格式
+    Timestamp = 6,
+    /// 文件路径：以 '/' 开头的路径，保持字符串但标记类型
+    Path = 7,
 }
 
 impl ParamType {
@@ -35,6 +43,10 @@ impl ParamType {
             1 => Some(ParamType::Integer),
             2 => Some(ParamType::Hex),
             3 => Some(ParamType::IPv4),
+            4 => Some(ParamType::BlockId),
+            5 => Some(ParamType::IPv4Port),
+            6 => Some(ParamType::Timestamp),
+            7 => Some(ParamType::Path),
             _ => None,
         }
     }
@@ -51,14 +63,29 @@ impl TypedParam {
     /// 从字符串自动检测类型并编码。
     /// 仅在能保证无损往返时才启用强类型编码。
     pub fn from_str(s: &str) -> Self {
+        if let Some(bytes) = Self::try_ipv4_port(s) {
+            return Self { ty: ParamType::IPv4Port, bytes };
+        }
         if let Some(bytes) = Self::try_ipv4(s) {
             return Self { ty: ParamType::IPv4, bytes };
+        }
+        if let Some(bytes) = Self::try_timestamp(s) {
+            return Self { ty: ParamType::Timestamp, bytes };
+        }
+        if let Some(bytes) = Self::try_block_id(s) {
+            return Self { ty: ParamType::BlockId, bytes };
         }
         if let Some(bytes) = Self::try_hex(s) {
             return Self { ty: ParamType::Hex, bytes };
         }
         if let Some(bytes) = Self::try_integer(s) {
             return Self { ty: ParamType::Integer, bytes };
+        }
+        if Self::looks_like_path(s) {
+            return Self {
+                ty: ParamType::Path,
+                bytes: s.as_bytes().to_vec(),
+            };
         }
         Self {
             ty: ParamType::String,
@@ -99,10 +126,41 @@ impl TypedParam {
                     String::from_utf8_lossy(&self.bytes).to_string()
                 }
             }
+            ParamType::BlockId => {
+                if self.bytes.len() >= 9 {
+                    let v = i64::from_le_bytes([
+                        self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+                        self.bytes[4], self.bytes[5], self.bytes[6], self.bytes[7],
+                    ]);
+                    match self.bytes[8] {
+                        b'b' => format!("blk_{}", v),
+                        _ => format!("blk_{}", v),
+                    }
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+            ParamType::IPv4Port => {
+                if self.bytes.len() >= 6 {
+                    let ip = format!("{}.{}.{}.{}", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]);
+                    let port = u16::from_le_bytes([self.bytes[4], self.bytes[5]]);
+                    format!("{}:{}", ip, port)
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+            ParamType::Timestamp => {
+                if self.bytes.len() >= 4 && self.bytes[0] == 0 {
+                    format!("{:02}{:02}{:02}", self.bytes[1], self.bytes[2], self.bytes[3])
+                } else {
+                    String::from_utf8_lossy(&self.bytes).to_string()
+                }
+            }
+            ParamType::Path => String::from_utf8_lossy(&self.bytes).to_string(),
         }
     }
 
-    fn try_integer(s: &str) -> Option<Vec<u8>> {
+    pub(crate) fn try_integer(s: &str) -> Option<Vec<u8>> {
         // 拒绝前导零、正号等会导致往返不一致的格式
         if s.is_empty() || s == "-" {
             return None;
@@ -127,7 +185,7 @@ impl TypedParam {
         Some(v.to_le_bytes().to_vec())
     }
 
-    fn try_hex(s: &str) -> Option<Vec<u8>> {
+    pub(crate) fn try_hex(s: &str) -> Option<Vec<u8>> {
         if s.len() < 3 {
             return None;
         }
@@ -156,7 +214,7 @@ impl TypedParam {
         Some(v.to_le_bytes().to_vec())
     }
 
-    fn try_ipv4(s: &str) -> Option<Vec<u8>> {
+    pub(crate) fn try_ipv4(s: &str) -> Option<Vec<u8>> {
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 4 {
             return None;
@@ -174,6 +232,70 @@ impl TypedParam {
             result.push(v);
         }
         Some(result)
+    }
+
+    pub(crate) fn try_ipv4_port(s: &str) -> Option<Vec<u8>> {
+        // 格式：IP:port，如 10.251.73.220:50010
+        if let Some(colon_pos) = s.rfind(':') {
+            let ip_part = &s[..colon_pos];
+            let port_part = &s[colon_pos + 1..];
+            if port_part.is_empty() || port_part.len() > 5 {
+                return None;
+            }
+            // 拒绝前导零
+            if port_part.len() > 1 && port_part.as_bytes()[0] == b'0' {
+                return None;
+            }
+            let port: u16 = port_part.parse().ok()?;
+            let ip_bytes = Self::try_ipv4(ip_part)?;
+            let mut result = ip_bytes;
+            result.extend_from_slice(&port.to_le_bytes());
+            return Some(result);
+        }
+        None
+    }
+
+    pub(crate) fn try_block_id(s: &str) -> Option<Vec<u8>> {
+        // 格式：blk_<integer> 或 blk_-<integer>
+        if !s.starts_with("blk_") {
+            return None;
+        }
+        let num_part = &s[4..];
+        if num_part.is_empty() {
+            return None;
+        }
+        // 拒绝前导零，如 blk_0123
+        if num_part.len() > 1 && num_part.as_bytes()[0] == b'0' {
+            return None;
+        }
+        if num_part.len() > 2 && num_part.starts_with("-0") {
+            return None;
+        }
+        let v: i64 = num_part.parse().ok()?;
+        let mut result = v.to_le_bytes().to_vec();
+        result.push(b'b'); // 前缀标记 'b' 表示 blk_
+        Some(result)
+    }
+
+    pub(crate) fn try_timestamp(s: &str) -> Option<Vec<u8>> {
+        // 仅处理 6 位日期/时间分量，如 081109 / 203615。
+        // 1-3 位数字保持 Integer，避免与带前导零的常规数字混淆。
+        if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+            let v: u32 = s.parse().ok()?;
+            let a = (v / 10000) as u8;       // 高 2 位
+            let b = ((v / 100) % 100) as u8; // 中 2 位
+            let c = (v % 100) as u8;         // 低 2 位
+            if a <= 99 && b <= 99 && c <= 99 {
+                // 0xYYMMDD 与 0xHHMMSS 在值域上可能重叠；
+                // 统一按 6 位数字处理，解码时输出原始 6 位数字，符合往返要求。
+                return Some(vec![0, a, b, c]);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn looks_like_path(s: &str) -> bool {
+        s.starts_with('/') && s.len() > 1
     }
 }
 
@@ -241,7 +363,8 @@ impl TemplateExtractor {
     /// 1. 对所有 message 按空格/标点分词
     /// 2. 按 token 数量分组
     /// 3. 组内逐 token 比较，标记变化位置为 Param
-    /// 4. 单条组（无同类）→ 每条作为独立模板（保留原始字符）
+    /// 4. 若生成的模板退化（固定 Literal 过少），按 token 类型模式子分组重试
+    /// 5. 单条组（无同类）→ 每条作为独立模板（保留原始字符）
     pub fn extract(batch: &[LogLine]) -> TemplateBatch {
         if batch.is_empty() {
             return TemplateBatch::default();
@@ -250,17 +373,19 @@ impl TemplateExtractor {
         // 分词
         let tokenized: Vec<Vec<String>> = batch.iter().map(|l| Self::tokenize(&l.message)).collect();
 
-        // 按 token 数分组
-        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        // 按 (token 数, 结构签名) 分组，避免语法结构不同但 token 数碰巧相同的
+        // 消息被错误合并为退化模板。
+        let mut groups: HashMap<(usize, String), Vec<usize>> = HashMap::new();
         for (i, tokens) in tokenized.iter().enumerate() {
-            groups.entry(tokens.len()).or_default().push(i);
+            let sig = Self::structural_signature(tokens);
+            groups.entry((tokens.len(), sig)).or_default().push(i);
         }
 
         let mut templates: Vec<Template> = Vec::new();
         let mut template_map: HashMap<String, u16> = HashMap::new();
         let mut records = Vec::with_capacity(batch.len());
 
-        for (_len, indices) in groups {
+        for ((_len, _sig), indices) in groups {
             if indices.len() < 2 {
                 // 单条无法聚类：每条作为独立模板
                 for &i in &indices {
@@ -273,10 +398,9 @@ impl TemplateExtractor {
                 continue;
             }
 
-            // 组内聚类：找公共 token 模式
+            // 先尝试标准聚类
             let first = &tokenized[indices[0]];
             let mut is_fixed = vec![true; first.len()];
-
             for &idx in indices.iter().skip(1) {
                 let tokens = &tokenized[idx];
                 for (j, (a, b)) in first.iter().zip(tokens.iter()).enumerate() {
@@ -286,15 +410,72 @@ impl TemplateExtractor {
                 }
             }
 
-            // 生成模板
-            let t = Self::build_template_from_mask(first, &is_fixed);
-            let pat_id = Self::get_or_create_template(&mut templates, &mut template_map, t);
+            let fixed_count = is_fixed.iter().filter(|&&f| f).count();
+            // 退化阈值：至少需要 2 个固定 Literal，且不能全部都是 Param
+            let min_fixed = (first.len() / 4).max(2);
+            let degenerate = fixed_count < min_fixed;
 
-            // 为组内所有行生成记录
-            for &idx in &indices {
-                let log = &batch[idx];
-                let params = Self::extract_params_with_mask(&tokenized[idx], &is_fixed);
-                records.push(Self::build_record(log, pat_id, params, idx));
+            if degenerate {
+                // 退化模板：同一 token 数但不同消息类型被错误合并。
+                // 按 token 类型模式子分组，防止将 dfs.FSNamesystem 消息
+                // 与 dfs.FSDataset 消息合并（它们 token 数碰巧相同）。
+                let mut sub_groups: HashMap<String, Vec<usize>> = HashMap::new();
+                for &idx in &indices {
+                    let tokens = &tokenized[idx];
+                    let type_sig: String = tokens
+                        .iter()
+                        .filter(|t| !t.chars().all(|c| c.is_whitespace()))
+                        .take(3)
+                        .map(|t| Self::token_type(t))
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    sub_groups.entry(type_sig).or_default().push(idx);
+                }
+
+                for (_sig, sub_indices) in sub_groups {
+                    if sub_indices.len() < 2 {
+                        for &i in &sub_indices {
+                            let log = &batch[i];
+                            let t = Self::raw_template(&tokenized[i]);
+                            let pat_id =
+                                Self::get_or_create_template(&mut templates, &mut template_map, t);
+                            let params =
+                                Self::extract_params(&tokenized[i], &templates[pat_id as usize]);
+                            records.push(Self::build_record(log, pat_id, params, i));
+                        }
+                        continue;
+                    }
+                    let sub_first = &tokenized[sub_indices[0]];
+                    let mut sub_fixed = vec![true; sub_first.len()];
+                    for &idx in sub_indices.iter().skip(1) {
+                        let tokens = &tokenized[idx];
+                        for (j, (a, b)) in sub_first.iter().zip(tokens.iter()).enumerate() {
+                            if a != b {
+                                sub_fixed[j] = false;
+                            }
+                        }
+                    }
+                    let t = Self::build_template_from_mask(sub_first, &sub_fixed);
+                    let pat_id =
+                        Self::get_or_create_template(&mut templates, &mut template_map, t);
+                    for &idx in &sub_indices {
+                        let log = &batch[idx];
+                        let params =
+                            Self::extract_params_with_mask(&tokenized[idx], &sub_fixed);
+                        records.push(Self::build_record(log, pat_id, params, idx));
+                    }
+                }
+            } else {
+                // 健康模板：直接使用
+                let t = Self::build_template_from_mask(first, &is_fixed);
+                let pat_id =
+                    Self::get_or_create_template(&mut templates, &mut template_map, t);
+
+                for &idx in &indices {
+                    let log = &batch[idx];
+                    let params = Self::extract_params_with_mask(&tokenized[idx], &is_fixed);
+                    records.push(Self::build_record(log, pat_id, params, idx));
+                }
             }
         }
 
@@ -418,6 +599,54 @@ impl TemplateExtractor {
     }
 
     // ---------- 私有工具 ----------
+
+    /// 结构签名：用于把语法结构相似的消息分到同一组。
+    /// 包含首 token（如果是单词型标识符）和所有 token 的类型序列。
+    fn structural_signature(tokens: &[String]) -> String {
+        let mut sig = String::new();
+        if let Some(first) = tokens.first() {
+            if Self::token_type(first) == "W" && !first.is_empty() && first.len() <= 64 {
+                sig.push_str(first);
+                sig.push('|');
+            }
+        }
+        for t in tokens {
+            sig.push_str(&Self::token_type(t));
+        }
+        sig
+    }
+
+    /// 单个 token 的类型标记，用于结构签名
+    fn token_type(t: &str) -> &'static str {
+        if t.chars().all(|c| c.is_whitespace()) {
+            return "S";
+        }
+        if TypedParam::try_ipv4_port(t).is_some() {
+            return "P";
+        }
+        if TypedParam::try_ipv4(t).is_some() {
+            return "I";
+        }
+        if TypedParam::try_timestamp(t).is_some() {
+            return "T";
+        }
+        if TypedParam::try_block_id(t).is_some() {
+            return "B";
+        }
+        if TypedParam::try_hex(t).is_some() {
+            return "H";
+        }
+        if TypedParam::try_integer(t).is_some() {
+            return "N";
+        }
+        if TypedParam::looks_like_path(t) {
+            return "h";
+        }
+        if t.chars().all(|c| c.is_ascii_punctuation()) {
+            return "C";
+        }
+        "W"
+    }
 
     fn tokenize(msg: &str) -> Vec<String> {
         let mut tokens = Vec::new();
@@ -665,6 +894,70 @@ mod tests {
         let p = TypedParam::from_str("007");
         assert_eq!(p.ty, ParamType::String);
         assert_eq!(p.to_string(), "007");
+    }
+
+    #[test]
+    fn test_typed_param_block_id() {
+        let p = TypedParam::from_str("blk_38865049064139660");
+        assert_eq!(p.ty, ParamType::BlockId);
+        assert_eq!(p.to_string(), "blk_38865049064139660");
+        assert_eq!(p.bytes.len(), 9);
+
+        let p2 = TypedParam::from_str("blk_-6952295868487656571");
+        assert_eq!(p2.ty, ParamType::BlockId);
+        assert_eq!(p2.to_string(), "blk_-6952295868487656571");
+    }
+
+    #[test]
+    fn test_typed_param_ipv4_port() {
+        let p = TypedParam::from_str("10.251.73.220:50010");
+        assert_eq!(p.ty, ParamType::IPv4Port);
+        assert_eq!(p.to_string(), "10.251.73.220:50010");
+        assert_eq!(p.bytes.len(), 6);
+    }
+
+    #[test]
+    fn test_typed_param_timestamp() {
+        let p = TypedParam::from_str("081109");
+        assert_eq!(p.ty, ParamType::Timestamp);
+        assert_eq!(p.to_string(), "081109");
+
+        let p2 = TypedParam::from_str("203615");
+        assert_eq!(p2.ty, ParamType::Timestamp);
+        assert_eq!(p2.to_string(), "203615");
+    }
+
+    #[test]
+    fn test_typed_param_path() {
+        let p = TypedParam::from_str("/user/root/rand/_temporary/_task_200811092030_0001_m_000590_0/part-00590.");
+        assert_eq!(p.ty, ParamType::Path);
+        assert_eq!(p.to_string(), "/user/root/rand/_temporary/_task_200811092030_0001_m_000590_0/part-00590.");
+    }
+
+    #[test]
+    fn test_structural_grouping_prevents_cross_type_merge() {
+        // 两条消息 token 数相同但语法结构完全不同，不应合并为退化模板
+        let logs = vec![
+            make_log(0, "PacketResponder 1 for block blk_111 terminating"),
+            make_log(1, "PacketResponder 2 for block blk_222 terminating"),
+            make_log(2, "BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.73.220:50010 is added to blk_333 size 67108864"),
+            make_log(3, "BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.73.221:50010 is added to blk_444 size 67108864"),
+        ];
+        let batch = TemplateExtractor::extract(&logs);
+
+        // 应提取 2 个模板，而不是 1 个退化模板
+        assert_eq!(batch.templates.len(), 2, "应分为 2 个不同模板");
+
+        // 检查没有全 Param 的退化模板
+        for t in &batch.templates {
+            let param_count = t.parts.iter().filter(|p| matches!(p, TemplatePart::Param)).count();
+            let literal_count = t.parts.len() - param_count;
+            assert!(
+                literal_count >= 2,
+                "模板不应退化（Literal 过少）: {:?}",
+                t
+            );
+        }
     }
 
     #[test]
