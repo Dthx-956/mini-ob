@@ -1,17 +1,14 @@
 //! mini-obs/agent/compressor.rs
-//! 日志压缩引擎 —— 预处理降熵 + Zstd 字典压缩
-//!
+//! 压缩引擎 —— 模板提取 + 文本参数序列化 + Zstd
 //!
 //! 设计策略（专利安全）：
 //! - 不直接实现 rANS/tANS（规避微软 US11234023B）
-//! - 采用"预处理降熵 + 标准 Zstd 库"双层架构
-
-//! mini-obs/agent/compressor.rs
-//! 压缩引擎 —— 模板降熵 + 64-bit XOR-P + Zstd
+//! - 模板字典用二进制 TLV（精确重建结构）
+//! - 记录参数保持文本格式（让 zstd LZ77 跨行匹配相似值）
 
 use std::io::{self, Read, Write};
 
-use crate::agent::template::{EncodedRecord, TemplateExtractor};
+use crate::agent::template::{TemplateBatch, TemplateExtractor};
 use crate::shared::format::LogLine;
 
 // ==================== 配置 ====================
@@ -50,9 +47,11 @@ impl Compressor {
     ///
     /// 流程：
     /// 1. 模板提取（若启用）
-    /// 2. XOR-P 编码
-    /// 3. 序列化为紧凑二进制
-    /// 4. Zstd 压缩
+    /// 2. 序列化为"模板字典(二进制) + 记录(文本参数)"的混合格式
+    /// 3. Zstd 压缩
+    ///
+    /// 参数保持文本形式而非 XOR-P 二进制编码，让 zstd 的 LZ77 能继续
+    /// 在相邻行的参数值之间找到字节级相似性。
     pub fn compress_batch(&self, logs: &[LogLine]) -> io::Result<Vec<u8>> {
         if logs.is_empty() {
             return Ok(Vec::new());
@@ -60,10 +59,8 @@ impl Compressor {
 
         let raw_bytes = if self.config.enable_template {
             let batch = TemplateExtractor::extract(logs);
-            let encoded = TemplateExtractor::encode_xor(&batch, self.config.xor_ref_reset);
-            Self::serialize_template(&batch.templates, &encoded)
+            Self::serialize_template_v2(&batch)
         } else {
-            // 回退：旧版 JSON Lines（保留兼容）
             Self::serialize_json_fallback(logs)
         };
 
@@ -77,23 +74,37 @@ impl Compressor {
         }
 
         let raw = self.zstd_decompress(data)?;
-        
-        // 尝试解析模板格式，失败则回退 JSON
-        if let Ok(logs) = Self::deserialize_template(&raw) {
+
+        // 尝试 v2 文本参数格式，失败则回退 JSON
+        if let Ok(logs) = Self::deserialize_template_v2(&raw) {
             return Ok(logs);
         }
-        
+
         Self::deserialize_json_fallback(&raw)
     }
 
-    // ---------- 序列化：模板二进制格式 ----------
+    // ---------- v2 序列化：模板字典(二进制) + 记录(文本参数) ----------
+    //
+    // 格式设计原则：
+    // - 模板字典保持二进制 TLV（体积小，需精确重建）
+    // - 记录用 \0 分隔的文本格式，参数保持原始文本表示
+    // - zstd 可以跨记录找到字节级模式（相同模板 → pat_id 重复，
+    //   相邻参数值相似 → zstd LZ77 匹配）
+    //
+    // 整体布局：
+    //   [template_count:u16][template_dict_TLV...]
+    //   [record_count:u32]
+    //   "{ts_delta}\0{svc_id}\0{level}\0{pat_id}\0{param_count}\0{p1}\0{p2}...\n"
+    //   ...
 
-    fn serialize_template(templates: &[crate::agent::template::Template], records: &[EncodedRecord]) -> Vec<u8> {
+    fn serialize_template_v2(
+        batch: &crate::agent::template::TemplateBatch,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // 1. 模板字典
-        buf.extend_from_slice(&(templates.len() as u16).to_le_bytes());
-        for t in templates {
+        // 1. 模板字典（二进制 TLV，与旧格式兼容）
+        buf.extend_from_slice(&(batch.templates.len() as u16).to_le_bytes());
+        for t in &batch.templates {
             buf.extend_from_slice(&(t.parts.len() as u16).to_le_bytes());
             for part in &t.parts {
                 match part {
@@ -110,33 +121,52 @@ impl Compressor {
             }
         }
 
-        // 2. 记录
-        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
-        for rec in records {
-            buf.extend_from_slice(&rec.ts_delta.to_le_bytes());
-            buf.push(rec.svc_id);
-            buf.push(rec.level.as_bytes()[0]); // D/I/W/E
-            buf.extend_from_slice(&rec.pat_id.to_le_bytes());
-            buf.extend_from_slice(&rec.param_encoding.ref_idx.to_le_bytes());
-            buf.extend_from_slice(&(rec.param_encoding.data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&rec.param_encoding.data);
+        // 2. 记录：文本格式，\0 分隔字段，\n 分隔记录
+        buf.extend_from_slice(&(batch.records.len() as u32).to_le_bytes());
+        // 二进制头与文本记录之间加换行，帮助 zstd 定位模式边界
+        buf.push(b'\n');
+
+        for rec in &batch.records {
+            // ts_delta (十进制字符串，比 8 字节固定宽度二进制更 zstd 友好)
+            write!(buf, "{}", rec.ts_delta).unwrap();
+            buf.push(0u8);
+            // svc_id
+            write!(buf, "{}", rec.svc_id).unwrap();
+            buf.push(0u8);
+            // level
+            buf.extend_from_slice(rec.level.as_bytes());
+            buf.push(0u8);
+            // pat_id
+            write!(buf, "{}", rec.pat_id).unwrap();
+            buf.push(0u8);
+            // param_count
+            write!(buf, "{}", rec.params.len()).unwrap();
+            // 参数：每个参数用 TypedParam::to_string() 的文本表示
+            for p in &rec.params {
+                buf.push(0u8);
+                buf.extend_from_slice(p.to_string().as_bytes());
+            }
+            buf.push(b'\n');
         }
 
         buf
     }
 
-    fn deserialize_template(data: &[u8]) -> io::Result<Vec<LogLine>> {
-        use crate::agent::template::{ParamEncoding, TemplateExtractor, TemplatePart};
+    fn deserialize_template_v2(data: &[u8]) -> io::Result<Vec<LogLine>> {
+        use crate::agent::template::{TemplatePart, TypedParam};
 
         let mut offset = 0;
-        let check = |offset, len| {
+        let check = |offset: usize, len: usize| {
             if offset + len > data.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "template deserialize truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "template v2 deserialize truncated",
+                ));
             }
             Ok(())
         };
 
-        // 解析模板字典
+        // ── 解析模板字典（二进制 TLV，与旧格式相同）──
         check(offset, 2)?;
         let tmpl_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
@@ -152,7 +182,9 @@ impl Compressor {
                 offset += 1;
                 if tag == 0x01 {
                     check(offset, 4)?;
-                    let len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
+                    let len = u32::from_le_bytes([
+                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                    ]) as usize;
                     offset += 4;
                     check(offset, len)?;
                     let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
@@ -162,53 +194,83 @@ impl Compressor {
                     parts.push(TemplatePart::Param);
                 }
             }
-            templates.push(crate::agent::template::Template { id: templates.len() as u16, parts });
+            templates.push(crate::agent::template::Template {
+                id: templates.len() as u16,
+                parts,
+            });
         }
 
-        // 解析记录
+        // ── 解析记录（文本格式）──
         check(offset, 4)?;
         let rec_count = u32::from_le_bytes([
             data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
         ]) as usize;
         offset += 4;
 
+        // 跳过分隔换行
+        if offset < data.len() && data[offset] == b'\n' {
+            offset += 1;
+        }
+
         let mut logs = Vec::with_capacity(rec_count);
         let mut prev_ts: u64 = 0;
-        let mut ref_params: Vec<crate::agent::template::TypedParam> = Vec::new();
 
         for rec_idx in 0..rec_count {
-            check(offset, 8)?;
-            let ts_delta = i64::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
-            ]);
-            offset += 8;
-            check(offset, 1)?;
-            let svc_id = data[offset];
-            offset += 1;
-            check(offset, 1)?;
-            let level = match data[offset] {
-                b'D' => "D".to_string(),
-                b'I' => "I".to_string(),
-                b'W' => "W".to_string(),
-                b'E' => "E".to_string(),
-                _ => "I".to_string(),
+            // 找到本条记录的结束位置（\n）
+            let rec_end = match data[offset..].iter().position(|&b| b == b'\n') {
+                Some(pos) => offset + pos,
+                None => data.len(),
             };
-            offset += 1;
-            check(offset, 2)?;
-            let pat_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            check(offset, 2)?;
-            let ref_idx = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
-            check(offset, 4)?;
-            let enc_len = u32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-            ]) as usize;
-            offset += 4;
-            check(offset, enc_len)?;
-            let enc_data = &data[offset..offset + enc_len];
-            offset += enc_len;
+            let rec_bytes = &data[offset..rec_end];
+            offset = rec_end + 1; // 跳过 \n
+
+            // 按 \0 分割字段
+            let fields: Vec<&[u8]> = rec_bytes.split(|&b| b == 0u8).collect();
+            if fields.len() < 5 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("record {} too few fields: {}", rec_idx, fields.len()),
+                ));
+            }
+
+            let ts_delta: i64 = std::str::from_utf8(fields[0])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let svc_id: u8 = std::str::from_utf8(fields[1])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let level = String::from_utf8_lossy(fields[2]).to_string();
+            let pat_id: u16 = std::str::from_utf8(fields[3])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let param_count: usize = std::str::from_utf8(fields[4])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            // 剩余字段是参数文本
+            let param_fields = &fields[5..];
+            if param_fields.len() < param_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "record {} param count mismatch: expected {}, got {} fields",
+                        rec_idx,
+                        param_count,
+                        param_fields.len()
+                    ),
+                ));
+            }
+            let params: Vec<TypedParam> = param_fields[..param_count]
+                .iter()
+                .map(|bytes| {
+                    let s = String::from_utf8_lossy(bytes);
+                    TypedParam::from_str(&s)
+                })
+                .collect();
 
             // 时间戳重建
             let ts = if rec_idx == 0 {
@@ -218,23 +280,6 @@ impl Compressor {
                 prev_ts = (prev_ts as i64 + ts_delta) as u64;
                 prev_ts
             };
-
-            // 参数解码
-            let enc_rec = crate::agent::template::EncodedRecord {
-                ts_delta,
-                svc_id,
-                level: level.clone(),
-                pat_id,
-                param_encoding: ParamEncoding {
-                    ref_idx,
-                    data: enc_data.to_vec(),
-                },
-            };
-
-            let params = TemplateExtractor::decode_xor(&enc_rec, &ref_params);
-            if ref_idx == 0 {
-                ref_params = params.clone();
-            }
 
             // 重建 message
             let template = &templates[pat_id as usize];
