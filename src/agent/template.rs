@@ -2,10 +2,10 @@
 //! 模板提取与 64-bit XOR-P 参数编码
 //!
 //! 核心设计：
-//! - Batch 级模板提取：按空格/标点分词，组内聚类公共模式
+//! - Batch 级模板提取：Prefix Tree (Trie) 聚类 + 自底向上子树合并
 //! - 无匹配 → 自动创建新模板，保留原始字符
 //! - 强类型参数：对整数、十六进制、IPv4 等常见日志参数做二进制编码
-//! - XOR-P 按 ARM64 字长（64-bit / 8 bytes）对齐操作
+//! - XOR-P 按 ARM64 字长（64-bit / 8 bytes）对齐操作（保留，供 Legacy 路径使用）
 //! - 编码格式：bitmap + literals，紧凑且 SIMD 友好
 
 use std::collections::HashMap;
@@ -359,130 +359,122 @@ pub struct TemplateExtractor;
 impl TemplateExtractor {
     /// 从一批日志中提取模板
     ///
-    /// 算法：
-    /// 1. 对所有 message 按空格/标点分词
-    /// 2. 按 token 数量分组
-    /// 3. 组内逐 token 比较，标记变化位置为 Param
-    /// 4. 若生成的模板退化（固定 Literal 过少），按 token 类型模式子分组重试
-    /// 5. 单条组（无同类）→ 每条作为独立模板（保留原始字符）
+    /// 算法：Prefix Tree (Trie) + 自底向上子树合并
+    ///
+    /// 1. 改进分词：按空格分割，不保留空格 token，标点作为独立 token
+    /// 2. 按 token 类型序列预分组（纯类型，不依赖首 token 值）
+    /// 3. 每组内构建值-Trie：每条消息是一条从根到叶的路径
+    /// 4. 自底向上合并结构相同的子树 → 多子节点合并为 Param 节点
+    /// 5. 从合并后的 Trie 提取模板并分配记录
     pub fn extract(batch: &[LogLine]) -> TemplateBatch {
         if batch.is_empty() {
             return TemplateBatch::default();
         }
 
-        // 分词
-        let tokenized: Vec<Vec<String>> = batch.iter().map(|l| Self::tokenize(&l.message)).collect();
+        // 1. 改进分词（不保留空白 token）
+        let tokenized: Vec<Vec<String>> = batch.iter().map(|l| Self::tokenize_v2(&l.message)).collect();
 
-        // 按 (token 数, 结构签名) 分组，避免语法结构不同但 token 数碰巧相同的
-        // 消息被错误合并为退化模板。
-        let mut groups: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+        // 2. 按 token 类型序列预分组（纯类型序列，无首 token 值依赖）
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, tokens) in tokenized.iter().enumerate() {
-            let sig = Self::structural_signature(tokens);
-            groups.entry((tokens.len(), sig)).or_default().push(i);
+            let type_seq = Self::type_sequence(tokens);
+            groups.entry(type_seq).or_default().push(i);
         }
 
         let mut templates: Vec<Template> = Vec::new();
         let mut template_map: HashMap<String, u16> = HashMap::new();
         let mut records = Vec::with_capacity(batch.len());
 
-        for ((_len, _sig), indices) in groups {
-            if indices.len() < 2 {
-                // 单条无法聚类：每条作为独立模板
-                for &i in &indices {
+        // 3. 对每组执行位置对齐分析，提取模板
+        for (_type_seq, indices) in &groups {
+            let idx_list: Vec<usize> = indices.clone();
+            if idx_list.len() < 2 {
+                // 单条消息：创建全 Literal 模板
+                for &i in &idx_list {
                     let log = &batch[i];
-                    let t = Self::raw_template(&tokenized[i]);
-                    let pat_id = Self::get_or_create_template(&mut templates, &mut template_map, t);
-                    let params = Self::extract_params(&tokenized[i], &templates[pat_id as usize]);
-                    records.push(Self::build_record(log, pat_id, params, i));
+                    let raw: Vec<TemplatePart> = tokenized[i].iter()
+                        .map(|t| TemplatePart::Literal(t.clone())).collect();
+                    if raw.is_empty() { continue; }
+                    let pid = Self::get_or_create_template(&mut templates, &mut template_map, raw);
+                    records.push(Self::build_record(log, pid, vec![], i));
                 }
                 continue;
             }
 
-            // 先尝试标准聚类
-            let first = &tokenized[indices[0]];
-            let mut is_fixed = vec![true; first.len()];
-            for &idx in indices.iter().skip(1) {
+            // 位置对齐：逐位置比较，相同=Literal，不同=Param
+            let first = &tokenized[idx_list[0]];
+            let n_tokens = first.len();
+            // 检查组内所有消息 token 数相同（类型序列已保证）
+            let mut is_fixed = vec![true; n_tokens];
+            for &idx in &idx_list[1..] {
                 let tokens = &tokenized[idx];
-                for (j, (a, b)) in first.iter().zip(tokens.iter()).enumerate() {
-                    if a != b {
+                for j in 0..n_tokens.min(tokens.len()) {
+                    if tokenized[idx_list[0]][j] != tokens[j] {
                         is_fixed[j] = false;
                     }
                 }
             }
 
             let fixed_count = is_fixed.iter().filter(|&&f| f).count();
-            // 退化阈值：至少需要 2 个固定 Literal，且不能全部都是 Param
-            let min_fixed = (first.len() / 4).max(2);
+            let min_fixed = (n_tokens / 4).max(2);
             let degenerate = fixed_count < min_fixed;
 
             if degenerate {
-                // 退化模板：同一 token 数但不同消息类型被错误合并。
-                // 按 token 类型模式子分组，防止将 dfs.FSNamesystem 消息
-                // 与 dfs.FSDataset 消息合并（它们 token 数碰巧相同）。
+                // 退化：按前几个 token 的精确值子分组
                 let mut sub_groups: HashMap<String, Vec<usize>> = HashMap::new();
-                for &idx in &indices {
+                for &idx in &idx_list {
                     let tokens = &tokenized[idx];
-                    let type_sig: String = tokens
-                        .iter()
-                        .filter(|t| !t.chars().all(|c| c.is_whitespace()))
-                        .take(3)
-                        .map(|t| Self::token_type(t))
+                    let prefix: String = tokens.iter()
+                        .take(4.min(tokens.len()))
+                        .map(|t| t.clone())
                         .collect::<Vec<_>>()
-                        .join("|");
-                    sub_groups.entry(type_sig).or_default().push(idx);
+                        .join("\0");
+                    sub_groups.entry(prefix).or_default().push(idx);
                 }
 
-                for (_sig, sub_indices) in sub_groups {
+                for (_prefix, sub_indices) in sub_groups {
                     if sub_indices.len() < 2 {
                         for &i in &sub_indices {
-                            let log = &batch[i];
-                            let t = Self::raw_template(&tokenized[i]);
-                            let pat_id =
-                                Self::get_or_create_template(&mut templates, &mut template_map, t);
-                            let params =
-                                Self::extract_params(&tokenized[i], &templates[pat_id as usize]);
-                            records.push(Self::build_record(log, pat_id, params, i));
+                            let raw: Vec<TemplatePart> = tokenized[i].iter()
+                                .map(|t| TemplatePart::Literal(t.clone())).collect();
+                            if raw.is_empty() { continue; }
+                            let pid = Self::get_or_create_template(&mut templates, &mut template_map, raw);
+                            records.push(Self::build_record(&batch[i], pid, vec![], i));
                         }
                         continue;
                     }
+
                     let sub_first = &tokenized[sub_indices[0]];
                     let mut sub_fixed = vec![true; sub_first.len()];
-                    for &idx in sub_indices.iter().skip(1) {
+                    for &idx in &sub_indices[1..] {
                         let tokens = &tokenized[idx];
-                        for (j, (a, b)) in sub_first.iter().zip(tokens.iter()).enumerate() {
-                            if a != b {
+                        for j in 0..sub_first.len().min(tokens.len()) {
+                            if sub_first[j] != tokens[j] {
                                 sub_fixed[j] = false;
                             }
                         }
                     }
-                    let t = Self::build_template_from_mask(sub_first, &sub_fixed);
-                    let pat_id =
-                        Self::get_or_create_template(&mut templates, &mut template_map, t);
+                    let parts = Self::mask_to_parts(sub_first, &sub_fixed);
+                    let pid = Self::get_or_create_template(&mut templates, &mut template_map, parts);
                     for &idx in &sub_indices {
-                        let log = &batch[idx];
-                        let params =
-                            Self::extract_params_with_mask(&tokenized[idx], &sub_fixed);
-                        records.push(Self::build_record(log, pat_id, params, idx));
+                        let params = Self::extract_params_from_mask(&tokenized[idx], &sub_fixed);
+                        records.push(Self::build_record(&batch[idx], pid, params, idx));
                     }
                 }
             } else {
-                // 健康模板：直接使用
-                let t = Self::build_template_from_mask(first, &is_fixed);
-                let pat_id =
-                    Self::get_or_create_template(&mut templates, &mut template_map, t);
-
-                for &idx in &indices {
-                    let log = &batch[idx];
-                    let params = Self::extract_params_with_mask(&tokenized[idx], &is_fixed);
-                    records.push(Self::build_record(log, pat_id, params, idx));
+                let parts = Self::mask_to_parts(first, &is_fixed);
+                let pid = Self::get_or_create_template(&mut templates, &mut template_map, parts);
+                for &idx in &idx_list {
+                    let params = Self::extract_params_from_mask(&tokenized[idx], &is_fixed);
+                    records.push(Self::build_record(&batch[idx], pid, params, idx));
                 }
             }
         }
 
-        // 恢复原始顺序
+        // 4. 恢复原始顺序
         records.sort_by_key(|r| r.original_idx);
 
-        // 计算时间戳差值：首行存绝对值，后续存 delta
+        // 5. 计算时间戳差值
         let mut prev_ts: i64 = 0;
         for (i, rec) in records.iter_mut().enumerate() {
             let abs_ts = rec.ts_delta;
@@ -496,6 +488,8 @@ impl TemplateExtractor {
 
         TemplateBatch { templates, records }
     }
+
+    // ---------- Prefix Tree (Trie) 实现 ----------
 
     /// 对 TemplateBatch 应用 64-bit XOR-P 编码
     ///
@@ -600,70 +594,22 @@ impl TemplateExtractor {
 
     // ---------- 私有工具 ----------
 
-    /// 结构签名：用于把语法结构相似的消息分到同一组。
-    /// 包含首 token（如果是单词型标识符）和所有 token 的类型序列。
-    fn structural_signature(tokens: &[String]) -> String {
-        let mut sig = String::new();
-        if let Some(first) = tokens.first() {
-            if Self::token_type(first) == "W" && !first.is_empty() && first.len() <= 64 {
-                sig.push_str(first);
-                sig.push('|');
-            }
-        }
-        for t in tokens {
-            sig.push_str(&Self::token_type(t));
-        }
-        sig
-    }
-
-    /// 单个 token 的类型标记，用于结构签名
-    fn token_type(t: &str) -> &'static str {
-        if t.chars().all(|c| c.is_whitespace()) {
-            return "S";
-        }
-        if TypedParam::try_ipv4_port(t).is_some() {
-            return "P";
-        }
-        if TypedParam::try_ipv4(t).is_some() {
-            return "I";
-        }
-        if TypedParam::try_timestamp(t).is_some() {
-            return "T";
-        }
-        if TypedParam::try_block_id(t).is_some() {
-            return "B";
-        }
-        if TypedParam::try_hex(t).is_some() {
-            return "H";
-        }
-        if TypedParam::try_integer(t).is_some() {
-            return "N";
-        }
-        if TypedParam::looks_like_path(t) {
-            return "h";
-        }
-        if t.chars().all(|c| c.is_ascii_punctuation()) {
-            return "C";
-        }
-        "W"
-    }
-
-    fn tokenize(msg: &str) -> Vec<String> {
+    /// v2 分词：保留空白作为独立 token（确保模板重建时保留空格）。
+    /// 标点符号作为独立 token 保留。
+    fn tokenize_v2(msg: &str) -> Vec<String> {
         let mut tokens = Vec::new();
         let mut current = String::new();
         for ch in msg.chars() {
             if ch.is_whitespace() {
                 if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
+                    tokens.push(std::mem::take(&mut current));
                 }
                 tokens.push(ch.to_string());
-            } else if ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':' {
+            } else if ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':' || ch == '/' {
                 current.push(ch);
             } else {
                 if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
+                    tokens.push(std::mem::take(&mut current));
                 }
                 tokens.push(ch.to_string());
             }
@@ -674,33 +620,53 @@ impl TemplateExtractor {
         tokens
     }
 
-    fn raw_template(tokens: &[String]) -> Vec<TemplatePart> {
-        tokens.iter().map(|t| TemplatePart::Literal(t.clone())).collect()
+    /// 计算 token 类型序列（纯类型，不依赖 token 值），用于预分组。
+    /// 空格标记为 's'。
+    fn type_sequence(tokens: &[String]) -> String {
+        let mut seq = String::with_capacity(tokens.len());
+        for t in tokens {
+            seq.push(Self::type_char(t));
+        }
+        seq
     }
 
-    fn build_template_from_mask(first: &[String], is_fixed: &[bool]) -> Vec<TemplatePart> {
-        first
-            .iter()
-            .zip(is_fixed.iter())
-            .map(|(token, fixed)| {
-                if *fixed {
-                    TemplatePart::Literal(token.clone())
-                } else {
-                    TemplatePart::Param
-                }
-            })
-            .collect()
+    /// 单个 token 的类型字符
+    fn type_char(t: &str) -> char {
+        if t.chars().all(|c| c.is_whitespace())    { return 's'; }
+        if TypedParam::try_ipv4_port(t).is_some()  { return 'P'; }
+        if TypedParam::try_ipv4(t).is_some()       { return 'I'; }
+        if TypedParam::try_timestamp(t).is_some()   { return 'T'; }
+        if TypedParam::try_block_id(t).is_some()    { return 'B'; }
+        if TypedParam::try_hex(t).is_some()         { return 'H'; }
+        if TypedParam::try_integer(t).is_some()     { return 'N'; }
+        if TypedParam::looks_like_path(t)           { return 'h'; }
+        if t.chars().all(|c| c.is_ascii_punctuation()) { return 'C'; }
+        'W'
     }
 
     fn build_record(log: &LogLine, pat_id: u16, params: Vec<TypedParam>, idx: usize) -> TemplateRecord {
         TemplateRecord {
             original_idx: idx,
             ts_delta: log.ts as i64,
-            svc_id: 0, // 由调用方后续映射
+            svc_id: 0,
             level: log.level.clone(),
             pat_id,
             params,
         }
+    }
+
+    /// 从 Literal/Param 掩码构建模板 parts
+    fn mask_to_parts(tokens: &[String], is_fixed: &[bool]) -> Vec<TemplatePart> {
+        tokens.iter().zip(is_fixed.iter())
+            .map(|(t, &fixed)| if fixed { TemplatePart::Literal(t.clone()) } else { TemplatePart::Param })
+            .collect()
+    }
+
+    /// 从掩码中提取参数值
+    fn extract_params_from_mask(tokens: &[String], is_fixed: &[bool]) -> Vec<TypedParam> {
+        tokens.iter().zip(is_fixed.iter())
+            .filter_map(|(t, &fixed)| if !fixed { Some(TypedParam::from_str(t)) } else { None })
+            .collect()
     }
 
     fn get_or_create_template(
@@ -708,7 +674,11 @@ impl TemplateExtractor {
         map: &mut HashMap<String, u16>,
         parts: Vec<TemplatePart>,
     ) -> u16 {
-        let sig = Self::template_signature(&parts);
+        // 模板签名：用于去重
+        let sig: String = parts.iter().map(|p| match p {
+            TemplatePart::Literal(s) => s.clone(),
+            TemplatePart::Param => "*".to_string(),
+        }).collect();
         if let Some(&id) = map.get(&sig) {
             return id;
         }
@@ -716,34 +686,6 @@ impl TemplateExtractor {
         templates.push(Template { id, parts });
         map.insert(sig, id);
         id
-    }
-
-    fn template_signature(parts: &[TemplatePart]) -> String {
-        parts
-            .iter()
-            .map(|p| match p {
-                TemplatePart::Literal(s) => s.clone(),
-                TemplatePart::Param => "*".to_string(),
-            })
-            .collect::<String>()
-    }
-
-    fn extract_params(tokens: &[String], template: &Template) -> Vec<TypedParam> {
-        let mut params = Vec::new();
-        for (token, part) in tokens.iter().zip(template.parts.iter()) {
-            if matches!(part, TemplatePart::Param) {
-                params.push(TypedParam::from_str(token));
-            }
-        }
-        params
-    }
-
-    fn extract_params_with_mask(tokens: &[String], is_fixed: &[bool]) -> Vec<TypedParam> {
-        tokens
-            .iter()
-            .zip(is_fixed.iter())
-            .filter_map(|(t, fixed)| if !fixed { Some(TypedParam::from_str(t)) } else { None })
-            .collect()
     }
 
     // ---------- 64-bit XOR-P 编解码（字节级） ----------
@@ -839,6 +781,248 @@ impl TemplateExtractor {
             buf[..copy].copy_from_slice(&bytes[offset..offset + copy]);
         }
         u64::from_le_bytes(buf)
+    }
+}
+
+// ==================== Prefix Tree (Trie) 节点 ====================
+
+/// Trie 节点：每个节点代表消息序列中的一个 token 位置。
+///
+/// 构建完成后通过 `compute_structure_keys()` 自底向上计算子树结构键。
+/// 提取时通过子节点结构键比较判断每个位置是 Param 还是 Literal。
+struct TrieNode {
+    token: String,
+    children: HashMap<String, TrieNode>,
+    count: usize,
+    msg_indices: Vec<usize>,
+    /// 子树结构键（自底向上计算，用于判断子节点位置是 Param 还是 Literal）
+    structure_key: String,
+    /// 合并后的备选 token（子树合并时保留的参数值）
+    alt_tokens: Vec<String>,
+}
+
+impl TrieNode {
+    fn new_root() -> Self {
+        Self { token: String::new(), children: HashMap::new(), count: 0, msg_indices: Vec::new(), structure_key: String::new(), alt_tokens: Vec::new() }
+    }
+
+    fn new(token: String) -> Self {
+        Self { token, children: HashMap::new(), count: 0, msg_indices: Vec::new(), structure_key: String::new(), alt_tokens: Vec::new() }
+    }
+
+    /// 插入一条消息的 token 序列
+    fn insert(&mut self, tokens: &[String], msg_idx: usize) {
+        self.count += 1;
+        if tokens.is_empty() {
+            self.msg_indices.push(msg_idx);
+            return;
+        }
+        let child = self.children
+            .entry(tokens[0].clone())
+            .or_insert_with(|| TrieNode::new(tokens[0].clone()));
+        child.insert(&tokens[1..], msg_idx);
+    }
+
+    /// 自底向上标记 Param 节点。
+    ///
+    /// 自底向上计算每个节点的子树结构键。
+    ///
+    /// 结构键用于判断两个子树是否具有相同的 Literal/Param 模式。
+    /// 键的格式：
+    ///   "."               — 叶节点（无子节点）
+    ///   "<T1,T2>"         — Param 位置（多个同结构子节点，T 是子节点 token 类型）
+    ///   "[T:k,...]"       — 分支点（多个不同结构子节点）
+    ///   <child_key>       — 单一子节点（跟随子节点的结构键）
+    fn compute_structure_keys(&mut self) {
+        for child in self.children.values_mut() {
+            child.compute_structure_keys();
+        }
+
+        self.structure_key = if self.children.is_empty() {
+            ".".to_string()
+        } else if self.children.len() == 1 {
+            self.children.values().next().unwrap().structure_key.clone()
+        } else {
+            let child_keys: Vec<&str> = self.children.values().map(|c| c.structure_key.as_str()).collect();
+            let first = child_keys[0];
+            if child_keys.iter().all(|&k| k == first) {
+                // 所有子节点结构相同 → 该位置是 Param
+                let mut types: Vec<String> = self.children.keys()
+                    .map(|k| TemplateExtractor::type_char(k).to_string())
+                    .collect();
+                types.sort();
+                format!("<{}>", types.join(","))
+            } else {
+                // 子节点结构不同 → 分支点（各自独立模板）
+                let mut parts: Vec<String> = self.children.iter()
+                    .map(|(k, v)| format!("{}:{}", TemplateExtractor::type_char(k), v.structure_key))
+                    .collect();
+                parts.sort();
+                format!("[{}]", parts.join(","))
+            }
+        };
+    }
+
+    /// 合并结构相同的子节点的子树，使更深层的 Param 能被正确识别。
+    ///
+    /// 当多个子节点结构相同时，将它们的子树递归合并到第一个子节点中，
+    /// 让更深层的不同值（如分散在不同分支的 IP）能在合并后的节点中比较。
+    fn merge_identical_children(&mut self) {
+        if self.children.len() <= 1 {
+            for child in self.children.values_mut() {
+                child.merge_identical_children();
+            }
+            return;
+        }
+
+        let first_key = self.children.values().next().unwrap().structure_key.clone();
+        let all_same = self.children.values().all(|c| c.structure_key == first_key);
+
+        if !all_same {
+            for child in self.children.values_mut() {
+                child.merge_identical_children();
+            }
+            return;
+        }
+
+        // 所有子节点结构相同 → 合并它们的子树以便更深层比较
+        let tokens: Vec<String> = self.children.keys().cloned().collect();
+        let mut merged = Vec::new();
+        for token in &tokens[1..] {
+            if let Some(child) = self.children.remove(token) {
+                merged.push(child);
+            }
+        }
+
+        if let Some(first) = self.children.values_mut().next() {
+            for other in merged {
+                first.merge_from(other);
+            }
+            // 递归合并更深层
+            first.merge_identical_children();
+            // 重新计算结构键（子树已合并）
+            first.compute_structure_keys();
+        }
+
+        // 重新计算当前节点的结构键
+        self.compute_structure_keys();
+    }
+
+    /// 将另一个节点的子树合并到当前节点中
+    fn merge_from(&mut self, other: TrieNode) {
+        self.count += other.count;
+        self.msg_indices.extend(other.msg_indices);
+        if !other.token.is_empty() && other.token != self.token {
+            self.alt_tokens.push(other.token.clone());
+        }
+        self.alt_tokens.extend(other.alt_tokens);
+        for (token, other_child) in other.children {
+            if let Some(my_child) = self.children.get_mut(&token) {
+                my_child.merge_from(other_child);
+            } else {
+                self.children.insert(token, other_child);
+            }
+        }
+    }
+
+    /// 所有可能的 token 值（包括合并来的备选 token）
+    fn all_tokens(&self) -> Vec<String> {
+        let mut tokens = vec![self.token.clone()];
+        tokens.extend(self.alt_tokens.clone());
+        tokens
+    }
+
+    /// 判断当前节点的子节点位置是否为 Param。
+    /// 当有多个子节点且它们的子树结构相同时返回 true。
+    fn children_are_param(&self) -> bool {
+        if self.children.len() <= 1 {
+            return false;
+        }
+        let first_key = &self.children.values().next().unwrap().structure_key;
+        self.children.values().all(|c| c.structure_key == *first_key)
+    }
+
+    /// 从合并后的 Trie 提取模板并分配记录。
+    ///
+    /// 遍历 Trie，在 Param 节点处收集子节点的 token 作为参数值，
+    /// 在 Literal 节点处将 token 加入模板定义。
+    fn extract_templates_and_records(
+        &self,
+        batch: &[LogLine],
+        templates: &mut Vec<Template>,
+        template_map: &mut HashMap<String, u16>,
+        records: &mut Vec<TemplateRecord>,
+    ) {
+        self._extract(batch, templates, template_map, records, &[], &[]);
+    }
+
+    fn _extract(
+        &self,
+        batch: &[LogLine],
+        templates: &mut Vec<Template>,
+        template_map: &mut HashMap<String, u16>,
+        records: &mut Vec<TemplateRecord>,
+        parts_so_far: &[TemplatePart],
+        params_so_far: &[TypedParam],
+    ) {
+        // 叶节点（无子节点）
+        if self.children.is_empty() {
+            let pat_id = if parts_so_far.is_empty() {
+                // 单条消息：创建全 Literal 模板
+                for &idx in &self.msg_indices {
+                    if idx >= batch.len() { continue; }
+                    let raw: Vec<TemplatePart> = TemplateExtractor::tokenize_v2(&batch[idx].message)
+                        .iter().map(|t| TemplatePart::Literal(t.clone())).collect();
+                    if raw.is_empty() { continue; }
+                    let pid = TemplateExtractor::get_or_create_template(templates, template_map, raw);
+                    records.push(TemplateExtractor::build_record(&batch[idx], pid, vec![], idx));
+                }
+                return;
+            } else {
+                TemplateExtractor::get_or_create_template(templates, template_map, parts_so_far.to_vec())
+            };
+
+            for &idx in &self.msg_indices {
+                if idx >= batch.len() { continue; }
+                records.push(TemplateExtractor::build_record(&batch[idx], pat_id, params_so_far.to_vec(), idx));
+            }
+            return;
+        }
+
+        if self.children_are_param() {
+            // 当前节点的子节点都是 Param：每个子节点的 token（含 alt_tokens）是参数值
+            // 但合并后只剩一个子节点，所以用 all_tokens() 获取全部参数值
+            let new_parts = [parts_so_far, &[TemplatePart::Param]].concat();
+            if self.children.len() == 1 {
+                // 合并后的情况：单个子节点持有所有参数值的 tokens
+                let child = self.children.values().next().unwrap();
+                let tokens = child.all_tokens();
+                for token in &tokens {
+                    if token.is_empty() { continue; }
+                    let mut p = params_so_far.to_vec();
+                    p.push(TypedParam::from_str(token));
+                    child._extract(batch, templates, template_map, records, &new_parts, &p);
+                }
+            } else {
+                // 未合并：每个子节点对应一个参数值
+                for child in self.children.values() {
+                    let mut p = params_so_far.to_vec();
+                    p.push(TypedParam::from_str(&child.token));
+                    child._extract(batch, templates, template_map, records, &new_parts, &p);
+                }
+            }
+        } else if self.children.len() == 1 {
+            // 单一 Literal 子节点
+            let (token, child) = self.children.iter().next().unwrap();
+            let new_parts = [parts_so_far, &[TemplatePart::Literal(token.clone())]].concat();
+            child._extract(batch, templates, template_map, records, &new_parts, params_so_far);
+        } else {
+            // 多个不同结构的子节点 → 各自独立模板分支
+            for child in self.children.values() {
+                let new_parts = [parts_so_far, &[TemplatePart::Literal(child.token.clone())]].concat();
+                child._extract(batch, templates, template_map, records, &new_parts, params_so_far);
+            }
+        }
     }
 }
 
@@ -1291,7 +1475,7 @@ mod tests {
             ("num123_456", vec!["num123_456"]),
         ];
         for (input, expected) in cases {
-            let tokens = TemplateExtractor::tokenize(input);
+            let tokens = TemplateExtractor::tokenize_v2(input);
             assert_eq!(tokens, expected.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         }
     }
