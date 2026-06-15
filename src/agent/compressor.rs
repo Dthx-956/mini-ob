@@ -92,26 +92,28 @@ impl Compressor {
     //   相邻参数值相似 → zstd LZ77 匹配）
     //
     // 整体布局：
-    //   [template_count:u16][template_dict_TLV...]
-    //   [record_count:u32]
+    //   [template_count: varuint][template_dict_TLV_varint...]
+    //   [record_count: varuint]\n
     //   "{ts_delta}\0{svc_id}\0{level}\0{pat_id}\0{param_count}\0{p1}\0{p2}...\n"
     //   ...
 
     fn serialize_template_v2(
         batch: &crate::agent::template::TemplateBatch,
     ) -> Vec<u8> {
+        use crate::shared::format::write_varuint;
+
         let mut buf = Vec::new();
 
-        // 1. 模板字典（二进制 TLV，与旧格式兼容）
-        buf.extend_from_slice(&(batch.templates.len() as u16).to_le_bytes());
+        // 1. 模板字典（二进制 TLV + varint，与 PatternTable v2 一致）
+        write_varuint(&mut buf, batch.templates.len() as u64);
         for t in &batch.templates {
-            buf.extend_from_slice(&(t.parts.len() as u16).to_le_bytes());
+            write_varuint(&mut buf, t.parts.len() as u64);
             for part in &t.parts {
                 match part {
                     crate::agent::template::TemplatePart::Literal(s) => {
                         buf.push(0x01);
                         let bytes = s.as_bytes();
-                        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        write_varuint(&mut buf, bytes.len() as u64);
                         buf.extend_from_slice(bytes);
                     }
                     crate::agent::template::TemplatePart::Param => {
@@ -122,7 +124,7 @@ impl Compressor {
         }
 
         // 2. 记录：文本格式，\0 分隔字段，\n 分隔记录
-        buf.extend_from_slice(&(batch.records.len() as u32).to_le_bytes());
+        write_varuint(&mut buf, batch.records.len() as u64);
         // 二进制头与文本记录之间加换行，帮助 zstd 定位模式边界
         buf.push(b'\n');
 
@@ -166,26 +168,28 @@ impl Compressor {
             Ok(())
         };
 
-        // ── 解析模板字典（二进制 TLV，与旧格式相同）──
-        check(offset, 2)?;
-        let tmpl_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
+        // ── 解析模板字典（二进制 TLV + varint）──
+        use crate::shared::format::read_varuint;
+        let (tmpl_count, new_off) = read_varuint(data, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "tmpl count"))?;
+        offset = new_off;
+        let tmpl_count = tmpl_count as usize;
         let mut templates = Vec::with_capacity(tmpl_count);
         for _ in 0..tmpl_count {
-            check(offset, 2)?;
-            let part_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            offset += 2;
+            let (part_count, new_off) = read_varuint(data, offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "part count"))?;
+            offset = new_off;
+            let part_count = part_count as usize;
             let mut parts = Vec::with_capacity(part_count);
             for _ in 0..part_count {
                 check(offset, 1)?;
                 let tag = data[offset];
                 offset += 1;
                 if tag == 0x01 {
-                    check(offset, 4)?;
-                    let len = u32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                    ]) as usize;
-                    offset += 4;
+                    let (len, new_off) = read_varuint(data, offset)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "literal len"))?;
+                    offset = new_off;
+                    let len = len as usize;
                     check(offset, len)?;
                     let s = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
                     offset += len;
@@ -200,12 +204,11 @@ impl Compressor {
             });
         }
 
-        // ── 解析记录（文本格式）──
-        check(offset, 4)?;
-        let rec_count = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        ]) as usize;
-        offset += 4;
+        // ── 解析记录（文本格式，varint 计数）──
+        let (rec_count, new_off) = read_varuint(data, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "rec count"))?;
+        offset = new_off;
+        let rec_count = rec_count as usize;
 
         // 跳过分隔换行
         if offset < data.len() && data[offset] == b'\n' {

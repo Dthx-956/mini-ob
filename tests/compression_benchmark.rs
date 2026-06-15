@@ -17,9 +17,11 @@ use mini_obs::shared::format::LogLine;
 
 /// 被测日志文件列表（相对于项目根目录）
 const LOG_FILES: &[(&str, &str)] = &[
-    ("Android", "tmp/Android_2k.log"),
-    ("OpenSSH", "tmp/OpenSSH_2k.log"),
+    ("Android",   "tmp/Android_2k.log"),
+    ("HDFS",      "tmp/HDFS_2k.log"),
+    ("OpenSSH",   "tmp/OpenSSH_2k.log"),
     ("OpenStack", "tmp/OpenStack_2k.log"),
+    ("Windows",   "tmp/Windows_2k.log"),
 ];
 
 fn project_root() -> PathBuf {
@@ -427,7 +429,7 @@ fn test_all_three_logs_summary() {
         results.push(result);
     }
 
-    assert_eq!(results.len(), 3, "应有 3 个日志文件的测试结果");
+    assert_eq!(results.len(), 5, "应有 5 个日志文件的测试结果");
 
     // ═══════════════════════════════════════════════════════════════════
     // 汇总对比表：三层拆解

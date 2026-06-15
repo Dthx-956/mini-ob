@@ -198,6 +198,70 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// ==================== 变长整数编码 ====================
+
+/// 写入无符号变长整数（varint），Protobuf 风格：每字节低 7 位为数据，MSB 为延续标志。
+/// 小值（0-127）用 1 字节，128-16383 用 2 字节，以此类推。
+pub fn write_varuint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8 & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+/// 写入有符号变长整数（zigzag + varint）：先做 zigzag 编码将有符号数映射为无符号数，
+/// 再用 varint 编码。小绝对值用更少字节。
+pub fn write_varint(buf: &mut Vec<u8>, value: i64) {
+    // zigzag: (value << 1) ^ (value >> 63)
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    write_varuint(buf, zigzag);
+}
+
+/// 读取无符号变长整数，返回 (value, new_absolute_offset)。
+pub fn read_varuint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    let mut consumed = 0usize;
+    loop {
+        if offset + consumed >= data.len() {
+            return None;
+        }
+        let byte = data[offset + consumed];
+        consumed += 1;
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None; // 溢出
+        }
+    }
+    Some((value, offset + consumed))
+}
+
+/// 读取有符号变长整数，返回 (value, new_absolute_offset)。
+pub fn read_varint(data: &[u8], offset: usize) -> Option<(i64, usize)> {
+    let (zigzag, new_off) = read_varuint(data, offset)?;
+    // 反 zigzag
+    let value = ((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64));
+    Some((value, new_off))
+}
+
+/// 计算无符号 varint 编码后的字节数
+pub fn varuint_size(value: u64) -> usize {
+    if value == 0 { return 1; }
+    let bits = 64 - value.leading_zeros();
+    ((bits + 6) / 7) as usize
+}
+
+/// 计算有符号 varint 编码后的字节数
+pub fn varint_size(value: i64) -> usize {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    varuint_size(zigzag)
+}
+
 // ==================== Segment 文件头 ====================
 
 /// Segment 文件头（64 字节，只读 mmap 安全）

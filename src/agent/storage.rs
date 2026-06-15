@@ -27,9 +27,10 @@ use crate::agent::template::{
     EncodedRecord, ParamEncoding, TemplateBatch, TemplateExtractor, TemplatePart, TypedParam,
 };
 use crate::shared::format::{
-    align_up, crc32, padding_needed, segment_name, ChunkEntry, ChunkSummary, LogLine,
-    SegmentFooter, SegmentHeader, SegmentSummary, ALIGNMENT, CHUNK_ENTRY_SIZE, CHUNK_SUMMARY_SIZE,
-    FORMAT_VERSION_V1, MIN_SEGMENT_SIZE, SEGMENT_FOOTER_SIZE, SEGMENT_HEADER_SIZE,
+    align_up, crc32, padding_needed, read_varint, read_varuint, segment_name, write_varint,
+    write_varuint, ChunkEntry, ChunkSummary, LogLine, SegmentFooter, SegmentHeader,
+    SegmentSummary, ALIGNMENT, CHUNK_ENTRY_SIZE, CHUNK_SUMMARY_SIZE, FORMAT_VERSION_V1,
+    MIN_SEGMENT_SIZE, SEGMENT_FOOTER_SIZE, SEGMENT_HEADER_SIZE,
 };
 
 // ==================== 配置与统计 ====================
@@ -659,14 +660,36 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             }
         }
 
-        // 4. 记录 payload：文本参数格式（zstd 友好）
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        for (pat_id, params) in text_params {
-            buf.extend_from_slice(&pat_id.to_le_bytes());
-            buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
+        // 4. 记录 payload：文本参数格式 + varint + delta pat_id
+        //
+        // 格式：
+        //   [n: varuint]
+        //   [first_pat_id: varuint]
+        //   for each record after first: [pat_delta: varint]  (diff from previous)
+        //   for each record:
+        //     [param_count: varuint]
+        //     for each param: [text_len: varuint] [text: bytes]
+        //
+        // 优势：连续同模板时 pat_delta=0 → 1 字节；param_count<128 → 1 字节；text_len<128 → 1 字节
+        write_varuint(&mut buf, n as u64);
+
+        // pat_id 差分编码
+        let mut prev_pat: i64 = 0;
+        for (i, (pat_id, params)) in text_params.iter().enumerate() {
+            let current = *pat_id as i64;
+            if i == 0 {
+                write_varuint(&mut buf, current as u64);
+            } else {
+                write_varint(&mut buf, current - prev_pat);
+            }
+            prev_pat = current;
+        }
+
+        for (_pat_id, params) in text_params {
+            write_varuint(&mut buf, params.len() as u64);
             for p in params {
                 let bytes = p.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                write_varuint(&mut buf, bytes.len() as u64);
                 buf.extend_from_slice(bytes);
             }
         }
@@ -1220,28 +1243,45 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             if services.len() == 1 { 0 } else { svc_indices[i] }
         };
 
-        // 4. records（文本参数格式：pat_id + param_count + [text_len + text]*）
-        check(offset, 4)?;
-        let stored_rec_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-        offset += 4;
-        if stored_rec_count != rec_count {
+        // 4. records（varint + delta pat_id + 文本参数格式）
+        let (stored_rec_count, new_off) = read_varuint(data, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "enhanced chunk record count"))?;
+        offset = new_off;
+        if stored_rec_count as usize != rec_count {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "enhanced chunk record count mismatch"));
+        }
+
+        // 解码 pat_id delta 编码
+        let mut pat_ids: Vec<u16> = Vec::with_capacity(rec_count);
+        for i in 0..rec_count {
+            if i == 0 {
+                let (val, new_off) = read_varuint(data, offset)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "pat_id base"))?;
+                offset = new_off;
+                pat_ids.push(val as u16);
+            } else {
+                let (delta, new_off) = read_varint(data, offset)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "pat_id delta"))?;
+                offset = new_off;
+                let pat_id = (pat_ids[i - 1] as i64 + delta) as u16;
+                pat_ids.push(pat_id);
+            }
         }
 
         let mut logs = Vec::with_capacity(rec_count);
         for i in 0..rec_count {
-            check(offset, 2)?;
-            let pat_id = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
-            offset += 2;
-            check(offset, 2)?;
-            let param_count = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
-            offset += 2;
+            let pat_id = pat_ids[i] as usize;
+            let (param_count, new_off) = read_varuint(data, offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "param count"))?;
+            offset = new_off;
+            let param_count = param_count as usize;
 
             let mut params: Vec<TypedParam> = Vec::with_capacity(param_count);
             for _ in 0..param_count {
-                check(offset, 2)?;
-                let text_len = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
-                offset += 2;
+                let (text_len, new_off) = read_varuint(data, offset)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "text len"))?;
+                offset = new_off;
+                let text_len = text_len as usize;
                 check(offset, text_len)?;
                 let text = String::from_utf8_lossy(&data[offset..offset + text_len]).to_string();
                 offset += text_len;

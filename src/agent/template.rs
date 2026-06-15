@@ -1481,19 +1481,28 @@ mod tests {
     }
 }
 
-// ==================== PatternTable 序列化（供 storage.rs 使用）====================
+// ==================== PatternTable 序列化 v2（varint，供 storage.rs 使用）====================
+//
+// 使用变长整数编码替代固定宽度 u16/u32：
+// - part_count（通常 < 30）：1 字节 vs 原来的 2 字节
+// - literal 长度（通常 < 127）：1 字节 vs 原来的 4 字节
+// - template 总数：1-2 字节 vs 原来的 2 字节
+//
+// 对于 30-40 个模板的典型 Segment，PatternTable 可缩小 30-50%。
+
+use crate::shared::format::{read_varuint, write_varuint};
 
 impl Template {
-    /// 序列化为字节流（TLV 格式）
+    /// 序列化为字节流（TLV + varint 格式）
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&(self.parts.len() as u16).to_le_bytes());
+        write_varuint(&mut buf, self.parts.len() as u64);
         for part in &self.parts {
             match part {
                 TemplatePart::Literal(s) => {
                     buf.push(0x01);
                     let bytes = s.as_bytes();
-                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    write_varuint(&mut buf, bytes.len() as u64);
                     buf.extend_from_slice(bytes);
                 }
                 TemplatePart::Param => {
@@ -1504,13 +1513,11 @@ impl Template {
         buf
     }
 
-    /// 从字节流反序列化
+    /// 从字节流反序列化（varint 格式）
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
-        if data.len() < 2 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "template too short"));
-        }
-        let part_count = u16::from_le_bytes([data[0], data[1]]) as usize;
-        let mut offset = 2;
+        let (part_count, mut offset) = read_varuint(data, 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "template part_count"))?;
+        let part_count = part_count as usize;
         let mut parts = Vec::with_capacity(part_count);
         for _ in 0..part_count {
             if offset >= data.len() {
@@ -1519,11 +1526,10 @@ impl Template {
             let tag = data[offset];
             offset += 1;
             if tag == 0x01 {
-                if offset + 4 > data.len() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "literal len"));
-                }
-                let len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
-                offset += 4;
+                let (len, new_off) = read_varuint(data, offset)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "literal len"))?;
+                let len = len as usize;
+                offset = new_off;
                 if offset + len > data.len() {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "literal bytes"));
                 }
@@ -1541,23 +1547,24 @@ impl Template {
 }
 
 impl TemplateBatch {
-    /// 序列化整个 PatternTable
+    /// 序列化整个 PatternTable（varint 模板计数）
     pub fn serialize_pattern_table(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&(self.templates.len() as u16).to_le_bytes());
+        write_varuint(&mut buf, self.templates.len() as u64);
         for t in &self.templates {
             buf.extend_from_slice(&t.serialize());
         }
         buf
     }
 
-    /// 从字节流反序列化 PatternTable
+    /// 从字节流反序列化 PatternTable（varint 模板计数）
     pub fn deserialize_pattern_table(data: &[u8]) -> io::Result<Vec<Template>> {
-        if data.len() < 2 {
+        if data.is_empty() {
             return Ok(Vec::new());
         }
-        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
-        let mut offset = 2;
+        let (count, mut offset) = read_varuint(data, 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "pattern table count"))?;
+        let count = count as usize;
         let mut templates = Vec::with_capacity(count);
         for i in 0..count {
             let (mut t, consumed) = Template::deserialize(&data[offset..])?;
