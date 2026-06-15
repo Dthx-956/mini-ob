@@ -412,7 +412,6 @@ mod tests {
             assert_eq!(a.message, b.message, "message mismatch at idx");
         }
     }
-// 将以下内容追加到 src/agent/compressor.rs 的 #[cfg(test)] mod tests 中
 
 #[test]
 fn test_compressor_empty_batch() {

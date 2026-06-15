@@ -3,8 +3,8 @@
 //!
 //! 写入流水线：
 //!   append -> WAL 文本追加 -> 内存缓冲 -> 阈值触发 flush
-//!   flush -> drain 缓冲 -> template 提取 -> 按 256 行切 Chunk
-//!          -> 每 Chunk 计算 Summary + XOR-P 编码 -> Zstd 压缩
+//!   flush -> drain 缓冲 -> template 提取 -> 按 chunk_size 切 Chunk
+//!          -> 每 Chunk 用文本参数序列化（zstd 友好）-> Zstd 压缩
 //!          -> 组装 Segment v2（PatternTable + ChunkTable + SummaryTable + Data）
 //!          -> index.add_segment 注册 -> WAL 截断
 //!
@@ -13,7 +13,7 @@
 //!     -> mmap Segment
 //!     -> 读取 PatternTable，构建 keyword -> pat_ids 映射
 //!     -> 遍历 ChunkSummary：时间 -> pattern_mask -> param_bloom
-//!     -> 仅对命中 Chunk 解压、XOR-P 还原、逐行匹配
+//!     -> 仅对命中 Chunk 解压、还原文本参数、逐行匹配
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -56,13 +56,13 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            max_buffer_lines: 1000,
-            max_buffer_bytes: 64 * 1024,
+            max_buffer_lines: 4096,
+            max_buffer_bytes: 256 * 1024,
             compression_level: 3,
-            chunk_size: 256,
+            chunk_size: 1024,
             dict: None,
-            single_chunk_threshold_lines: 10_000,
-            single_chunk_threshold_bytes: 5 * 1024 * 1024,
+            single_chunk_threshold_lines: 4_096,
+            single_chunk_threshold_bytes: 2 * 1024 * 1024,
             // 默认禁用 Segment 级字典：对高度模板化日志收益有限，
             // 且训练/存储字典会带来额外开销。需要时显式调小。
             dict_training_min_chunks: usize::MAX,
@@ -400,53 +400,16 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             let summary = ChunkSummary::new(pattern_mask, level_mask, bloom);
             chunk_summaries.push(summary);
 
-            // 2b. XOR-P 编码（Chunk 内首行存原始，后续引用 Chunk 首行）
+            // 2b. 收集文本参数（不进行 XOR-P 编码，保持参数文本以便 zstd 匹配）
             let chunk_records = &batch.records[start..end];
-            let mut ref_params: Vec<TypedParam> = Vec::new();
-            let mut last_ref_idx: usize = 0;
-            let mut encoded_records = Vec::with_capacity(chunk_records.len());
-
-            for (i, rec) in chunk_records.iter().enumerate() {
-                let mut encoding_data = Vec::new();
-                encoding_data.extend_from_slice(&(rec.params.len() as u32).to_le_bytes());
-
-                // 当参数数量或类型与参考行不一致时，当前行必须作为新的参考行
-                let need_new_ref = i == 0
-                    || rec.params.len() != ref_params.len()
-                    || rec.params.iter().zip(ref_params.iter()).any(|(a, b)| a.ty != b.ty);
-
-                if need_new_ref {
-                    // 参考行：直接存储强类型二进制
-                    ref_params = rec.params.clone();
-                    last_ref_idx = i;
-                    for p in &rec.params {
-                        encoding_data.push(p.ty as u8);
-                        encoding_data.extend_from_slice(&(p.bytes.len() as u32).to_le_bytes());
-                        encoding_data.extend_from_slice(&p.bytes);
-                    }
-                } else {
-                    // 非参考行：XOR-P 编码（在强类型二进制上执行）
-                    for (p, base) in rec.params.iter().zip(ref_params.iter()) {
-                        encoding_data.push(p.ty as u8);
-                        let encoded = TemplateExtractor::xor_param_bytes(&p.bytes, &base.bytes);
-                        encoding_data.extend_from_slice(&encoded);
-                    }
-                }
-
-                encoded_records.push(EncodedRecord {
-                    ts_delta: rec.ts_delta,
-                    svc_id: rec.svc_id,
-                    level: rec.level.clone(),
-                    pat_id: rec.pat_id,
-                    param_encoding: crate::agent::template::ParamEncoding {
-                        ref_idx: (i - last_ref_idx) as u16,
-                        data: encoding_data,
-                    },
-                });
+            let mut text_params: Vec<(u16, Vec<String>)> = Vec::with_capacity(chunk_records.len());
+            for rec in chunk_records.iter() {
+                let param_texts: Vec<String> = rec.params.iter().map(|p| p.to_string()).collect();
+                text_params.push((rec.pat_id, param_texts));
             }
 
-            // 2c. 序列化 Chunk 二进制（先不压缩，用于后续字典训练）
-            let chunk_binary = self.serialize_chunk_binary(&encoded_records, chunk_logs);
+            // 2c. 序列化 Chunk 为文本参数格式（zstd 友好，先不压缩）
+            let chunk_binary = self.serialize_chunk_text(chunk_logs, &text_params);
             chunk_entries.push(ChunkEntry::new(
                 0, // offset 与 compressed/original sz 稍后回填
                 0,
@@ -602,14 +565,17 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
     /// - Level：2-bit 位图打包
     /// - Service：去重表 + 每行索引（单 service 时直接共享）
     /// - 记录：pat_id + ref_idx + 参数编码
-    fn serialize_chunk_binary(&self, records: &[EncodedRecord], logs: &[LogLine]) -> Vec<u8> {
+    /// 序列化 Chunk 为文本参数格式（zstd 友好）
+    ///
+    /// 格式与 Compressor v2 保持一致：时间戳/level/service 用高效二进制编码，
+    /// 参数保持文本形式，让 zstd 可以跨记录找到字节级相似性。
+    fn serialize_chunk_text(&self, logs: &[LogLine], text_params: &[(u16, Vec<String>)]) -> Vec<u8> {
         use std::collections::HashMap;
 
-        let n = records.len();
-        assert_eq!(n, logs.len());
-        let mut buf = Vec::with_capacity(n * 32);
+        let n = logs.len();
+        let mut buf = Vec::with_capacity(n * 64);
 
-        // 1. 时间戳：base_ts + deltas
+        // 1. 时间戳：base_ts + deltas（二进制，高效）
         let base_ts = logs.first().map(|l| l.ts).unwrap_or(0);
         let mut deltas = Vec::with_capacity(n.saturating_sub(1));
         let mut prev = base_ts as i64;
@@ -643,11 +609,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
         let mut level_bm = vec![0u8; bitmap_len];
         for (i, log) in logs.iter().enumerate() {
             let bits = match log.level.as_str() {
-                "D" => 0u8,
-                "I" => 1u8,
-                "W" => 2u8,
-                "E" => 3u8,
-                _ => 1u8,
+                "D" => 0u8, "I" => 1u8, "W" => 2u8, "E" => 3u8, _ => 1u8,
             };
             level_bm[i / 4] |= bits << ((i % 4) * 2);
         }
@@ -669,13 +631,11 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
         }
 
         if unique.len() == 1 {
-            // mode 0：共享单一 service
             buf.push(0u8);
             let b = unique[0].as_bytes();
             buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
             buf.extend_from_slice(b);
         } else if unique.len() <= 255 {
-            // mode 1：每行 u8 索引
             buf.push(1u8);
             buf.extend_from_slice(&(unique.len() as u16).to_le_bytes());
             for svc in &unique {
@@ -687,7 +647,6 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
                 buf.push(idx as u8);
             }
         } else {
-            // mode 2：每行 u16 索引
             buf.push(2u8);
             buf.extend_from_slice(&(unique.len() as u16).to_le_bytes());
             for svc in &unique {
@@ -700,13 +659,16 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             }
         }
 
-        // 4. 记录 payload
+        // 4. 记录 payload：文本参数格式（zstd 友好）
         buf.extend_from_slice(&(n as u32).to_le_bytes());
-        for rec in records {
-            buf.extend_from_slice(&rec.pat_id.to_le_bytes());
-            buf.extend_from_slice(&rec.param_encoding.ref_idx.to_le_bytes());
-            buf.extend_from_slice(&(rec.param_encoding.data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&rec.param_encoding.data);
+        for (pat_id, params) in text_params {
+            buf.extend_from_slice(&pat_id.to_le_bytes());
+            buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
+            for p in params {
+                let bytes = p.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
         }
 
         buf
@@ -1258,7 +1220,7 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
             if services.len() == 1 { 0 } else { svc_indices[i] }
         };
 
-        // 4. records
+        // 4. records（文本参数格式：pat_id + param_count + [text_len + text]*）
         check(offset, 4)?;
         let stored_rec_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
         offset += 4;
@@ -1267,27 +1229,51 @@ fn read_segment_size_stats(path: &Path) -> io::Result<(u64, u64)> {
         }
 
         let mut logs = Vec::with_capacity(rec_count);
-        let mut ref_params: Vec<TypedParam> = Vec::new();
         for i in 0..rec_count {
             check(offset, 2)?;
-            let pat_id = u16::from_le_bytes([data[offset], data[offset+1]]);
+            let pat_id = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
             offset += 2;
             check(offset, 2)?;
-            let ref_idx = u16::from_le_bytes([data[offset], data[offset+1]]);
+            let param_count = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
             offset += 2;
-            check(offset, 4)?;
-            let enc_len = u32::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-            ]) as usize;
-            offset += 4;
-            check(offset, enc_len)?;
-            let enc_data = &data[offset..offset+enc_len];
-            offset += enc_len;
 
-            let ts = timestamps[i];
-            let service = services[svc_index_for(i)].clone();
-            let level = level_for(i);
-            logs.push(self.decode_one_record(pat_id, ref_idx, enc_data, templates, &mut ref_params, ts, service, level));
+            let mut params: Vec<TypedParam> = Vec::with_capacity(param_count);
+            for _ in 0..param_count {
+                check(offset, 2)?;
+                let text_len = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+                offset += 2;
+                check(offset, text_len)?;
+                let text = String::from_utf8_lossy(&data[offset..offset + text_len]).to_string();
+                offset += text_len;
+                params.push(TypedParam::from_str(&text));
+            }
+
+            // 重建 message
+            let message = if let Some(t) = templates.get(pat_id) {
+                let mut msg = String::new();
+                let mut param_idx = 0;
+                for part in &t.parts {
+                    match part {
+                        TemplatePart::Literal(s) => msg.push_str(s),
+                        TemplatePart::Param => {
+                            if let Some(p) = params.get(param_idx) {
+                                msg.push_str(&p.to_string());
+                                param_idx += 1;
+                            }
+                        }
+                    }
+                }
+                msg
+            } else {
+                params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+            };
+
+            logs.push(LogLine {
+                ts: timestamps[i],
+                service: services[svc_index_for(i)].clone(),
+                level: level_for(i),
+                message,
+            });
         }
 
         Ok(logs)
@@ -1715,8 +1701,10 @@ fn test_enhanced_chunk_binary_timestamp_constant() {
         .map(|i| make_log(1000 + i as u64 * 100, "svc", "I", &format!("msg {}", i)))
         .collect();
     let batch = TemplateExtractor::extract(&logs);
-    let records = TemplateExtractor::encode_xor(&batch, 16);
-    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let text_params: Vec<(u16, Vec<String>)> = batch.records.iter()
+        .map(|r| (r.pat_id, r.params.iter().map(|p| p.to_string()).collect()))
+        .collect();
+    let binary = engine.serialize_chunk_text(&logs, &text_params);
     let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
     assert_eq!(decoded, logs);
 }
@@ -1733,8 +1721,10 @@ fn test_enhanced_chunk_binary_multiple_services() {
         })
         .collect();
     let batch = TemplateExtractor::extract(&logs);
-    let records = TemplateExtractor::encode_xor(&batch, 16);
-    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let text_params: Vec<(u16, Vec<String>)> = batch.records.iter()
+        .map(|r| (r.pat_id, r.params.iter().map(|p| p.to_string()).collect()))
+        .collect();
+    let binary = engine.serialize_chunk_text(&logs, &text_params);
     let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
     assert_eq!(decoded, logs);
 }
@@ -1756,8 +1746,10 @@ fn test_enhanced_chunk_binary_mixed_levels() {
         })
         .collect();
     let batch = TemplateExtractor::extract(&logs);
-    let records = TemplateExtractor::encode_xor(&batch, 16);
-    let binary = engine.serialize_chunk_binary(&records, &logs);
+    let text_params: Vec<(u16, Vec<String>)> = batch.records.iter()
+        .map(|r| (r.pat_id, r.params.iter().map(|p| p.to_string()).collect()))
+        .collect();
+    let binary = engine.serialize_chunk_text(&logs, &text_params);
     let decoded = engine.deserialize_chunk_binary_enhanced(&binary, &batch.templates).unwrap();
     assert_eq!(decoded, logs);
 }
