@@ -1,306 +1,341 @@
-# Mini-OBS 架构交接文档
+# Mini-OBS — 边缘原生轻量级日志管理系统
 
-## 1. 项目定位
+[![Rust](https://github.com/your-org/mini-obs/actions/workflows/rust.yml/badge.svg)](https://github.com/your-org/mini-obs/actions/workflows/rust.yml)
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)
 
-**目标**：面向资源受限边缘设备（树莓派 4B 为基准）的轻量级日志管理系统，实现**高压缩存储（>10x）+ 秒级本地查询 + 崩溃恢复**，且**规避微软 ANS 专利（US11234023B）**。
+## 1. 项目简介
 
-**核心创新**：不直接实现 rANS/tANS，而是通过 **Delta 时间戳编码 + 行间 RLE + 服务名引用** 三层预处理降低输入熵，再调用标准 Zstd 库（内部封装 ANS/FSE）完成压缩，在专利安全前提下逼近熵极限。
+Mini-OBS 是一个面向**资源受限边缘设备**（树莓派 4B 为基准硬件）的轻量级日志管理系统。
+
+**核心目标**：在边缘侧实现 **>10x 压缩存储 + 秒级本地查询 + 崩溃自动恢复**，同时规避微软 ANS 专利（US11234023B）。
+
+### 核心特性
+
+- 🗜️ **高压缩比**：Delta 时间戳 + 模板提取 + XOR-P 编码 + Zstd 字典压缩，实测 >10x
+- 🔍 **秒级查询**：内存索引 + Segment mmap + ChunkSummary 两阶段过滤，避免全量解压
+- 🔒 **专利安全**：不直接实现 rANS/tANS，通过预处理降熵后调用标准 Zstd 库（内部封装 ANS/FSE）
+- ⚡ **崩溃恢复**：文本 WAL 保证断电不丢数据，启动时自动重放恢复
+- 🧩 **模板压缩 v2**：Batch 级模板提取 + 强类型参数（int/hex/IPv4/BlockId）+ 64-bit XOR-P 编码
+- 🎯 **多源采集**：文件 tail、stdin、模拟生成器
+- 🐳 **Docker 友好**：支持 x86_64 / aarch64 交叉编译
 
 ---
 
-## 2. 目录结构
+## 2. 快速开始
+
+### 构建
+
+```bash
+# 依赖：Rust 1.70+ (edition 2021)
+cargo build --release
+
+# 交叉编译（树莓派 4B）
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+### 运行测试
+
+```bash
+# 全部测试（147 个）
+cargo test
+
+# 按模块测试
+cargo test agent::storage
+cargo test agent::compressor
+cargo test agent::template
+cargo test agent::index
+cargo test agent::collector
+cargo test shared::format
+```
+
+### CLI 使用
+
+```bash
+# 生成测试日志
+./target/release/mini-obs generate 10000 /tmp/test.log my-service
+
+# 启动采集代理（tail 模式）
+./target/release/mini-obs agent /data/mini-obs nginx /var/log/nginx/access.log
+
+# 查询日志
+./target/release/mini-obs query /data/mini-obs 0 9999999999999 ERROR 50
+
+# 查看统计
+./target/release/mini-obs stats /data/mini-obs
+```
+
+---
+
+## 3. 目录结构
 
 ```
 mini-obs/
-├── Cargo.toml
-└── src/
-    ├── main.rs              # 入口（当前为占位，需补充 CLI/服务化逻辑）
-    ├── lib.rs               # 库入口（pub mod agent; pub mod shared;）
-    ├── agent/               # 边缘 Agent 核心
-    │   ├── mod.rs           # 模块聚合，重新导出公共类型
-    │   ├── storage.rs       # ✅ 已重构：基于 format.rs 规范的存储引擎
-    │   ├── index.rs         # ✅ 已完成：内存索引 + 磁盘 Manifest
-    │   ├── collector.rs     # ✅ 已完成：文件 tail / stdin / 模拟生成
-    │   └── compressor.rs    # ✅ 已完成：Delta+RLE+Zstd 压缩
-    └── shared/              # 跨模块共享
-        ├── mod.rs
-        └── format.rs        # ✅ 已完成：MOBS 二进制格式契约
+├── Cargo.toml                         # 项目配置 (v0.2.0, edition 2021)
+├── readme                             # 本文件
+├── .github/workflows/rust.yml         # CI：构建 + 测试
+├── src/
+│   ├── main.rs                        # CLI 入口（agent / query / generate / stats）
+│   ├── lib.rs                         # 库入口 + 测试工具
+│   ├── agent/
+│   │   ├── mod.rs                     # 模块聚合，重新导出公共类型
+│   │   ├── collector.rs               # 采集引擎（file tail / stdin / mock）
+│   │   ├── compressor.rs              # 压缩引擎（Delta+RLE+服务引用+Zstd+字典）
+│   │   ├── template.rs                # 🆕 模板提取 + XOR-P 参数编码
+│   │   ├── index.rs                   # 内存索引 + 磁盘 Manifest
+│   │   └── storage.rs                 # 存储引擎（WAL + v2 多 Chunk Segment）
+│   └── shared/
+│       ├── mod.rs
+│       └── format.rs                  # MOBS 二进制格式契约（v1 + v2 兼容）
+├── tests/
+│   ├── integration_test.rs            # 集成测试
+│   ├── integration_test2.rs           # 集成测试（扩展）
+│   ├── compression_effectiveness.rs   # 压缩效果基准测试
+│   ├── compressor_standalone.rs       # 压缩器独立测试
+│   ├── template_diagnostic.rs         # 模板诊断测试
+│   └── gen_logs.py                    # 测试日志生成脚本
+└── docs/                              # 文档
 ```
 
 ---
 
-## 3. 模块关系图
+## 4. 架构概览
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        外部调用方                              │
-│                   (main.rs / CLI / 测试)                      │
-└───────────────────────┬───────────────────────────────────────┘
-                        │
-┌───────────────────────▼───────────────────────────────────────┐
-│                      agent/mod.rs                               │
-│  重新导出：Collector, Compressor, Index, StorageEngine           │
-└───────────────────────┬───────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────┐
-        │               │               │
-┌───────▼──────┐ ┌──────▼──────┐ ┌─────▼──────┐
-│  collector   │ │ compressor  │ │   index    │
-│  采集层      │ │ 压缩层      │ │ 索引层      │
-│  生产者线程  │ │ 降熵+Zstd   │ │ 内存+磁盘   │
-└───────┬──────┘ └──────┬──────┘ └─────┬──────┘
-        │               │               │
-        └───────────────┼───────────────┘
-                        │
-               ┌────────▼────────┐
-               │    storage      │
-               │    存储引擎      │
-               │  WAL+Segment    │
-               └────────┬────────┘
-                        │
-        ┌───────────────┴───────────────┐
-        │                               │
-┌───────▼────────┐            ┌────────▼────────┐
-│  shared/format  │            │   Zstd 标准库    │
-│  MOBS 二进制格式 │            │  （专利安全封装） │
-└─────────────────┘            └─────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       main.rs (CLI)                           │
+│           agent / query / generate / stats                    │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│                     agent/mod.rs                               │
+│     重新导出：Collector, Compressor, Index, StorageEngine       │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+┌───────▼──────┐  ┌─────────▼──────┐  ┌────────▼──────┐
+│  collector   │  │  template.rs   │  │    index       │
+│  采集层       │  │  模板提取      │  │   索引层       │
+│  生产者线程   │  │  XOR-P 编码    │  │   内存+磁盘    │
+└───────┬──────┘  └─────────┬──────┘  └────────┬──────┘
+        │                   │                   │
+        └───────────────────┼───────────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │  compressor     │
+                   │  Delta+RLE+Zstd │
+                   └────────┬────────┘
+                            │
+                   ┌────────▼────────┐
+                   │    storage       │
+                   │  WAL + Segment   │
+                   │  v2 多Chunk格式  │
+                   └────────┬────────┘
+                            │
+            ┌───────────────┴───────────────┐
+            │                               │
+┌───────────▼──────────┐     ┌──────────────▼──────────┐
+│   shared/format.rs   │     │     Zstd 标准库           │
+│   MOBS 二进制格式     │     │    （专利安全封装）        │
+│   v1 + v2 兼容        │     │                          │
+└──────────────────────┘     └─────────────────────────┘
 ```
 
 ---
 
-## 4. 各模块状态与职责
+## 5. 模块说明
 
-### 4.1 `shared/format.rs` —— 二进制契约层（✅ 已完成）
+### 5.1 `shared/format.rs` — 二进制格式契约
 
-**职责**：定义 MOBS（Mini-OBS Segment）文件格式、Manifest 索引格式、CRC 算法，零业务逻辑。
+定义 MOBS 存储格式的所有结构体与常量。
 
-**核心类型**：
-- `SegmentHeader`（64 字节）：魔数 `MOBS` + 版本 + chunk_count + created_at + segment_id + CRC32
-- `ChunkEntry`（32 字节）：offset + compressed_sz + original_sz + line_count + min_ts + max_ts
-- `SegmentFooter`（8 字节）：chunk_table_offset + content_crc32
-- `ManifestEntry`（64 字节）：segment_id + min/max_ts + line_count + path_hash + flags + reserved
-- `ManifestHeader`（9 字节）：魔数 `MIDX` + version + entry_count
-- `LogLine`：JSON 紧凑格式 `{"t":u64,"s":"svc","l":"E","m":"msg"}`
+| 结构体 | 大小 | 说明 |
+|--------|------|------|
+| `SegmentHeader` | 64 B | 魔数 `MOBS` + 版本 + chunk_count + created_at + segment_id + CRC32 |
+| `ChunkEntry` | 32 B | offset + compressed_sz + original_sz + line_count + min_ts + max_ts |
+| `ChunkSummary` | 80 B | 🆕 v2 新增：min/max_ts + line_count + pattern_mask + param_bloom |
+| `SegmentFooter` | 8 B | chunk_table_offset + content_crc32 |
+| `ManifestEntry` | 64 B | segment_id + min/max_ts + line_count + path_hash + flags |
+| `ManifestHeader` | 9 B | 魔数 `MIDX` + version + entry_count |
+| `LogLine` | — | `{"t":ts,"s":"svc","l":"E","m":"msg"}` |
 
-**关键函数**：
-- `crc32(data: &[u8]) -> u32`：IEEE 802.3 多项式，与 zlib 兼容
-- `align_up(size, alignment) -> usize`：4KB 对齐
-- `segment_name(id) -> String`：`segment-00000042.mobs`
-- `hash_path(path) -> u64`：FNV-1a 64bit
+所有结构体使用 `#[repr(C)]` + 小端序，保证跨平台（x86_64 / aarch64）mmap 零拷贝解析。
 
-**约束**：所有结构体使用 `#[repr(C)]`，字段小端序（`to_le_bytes`），保证跨平台（x86_64 / aarch64）mmap 零拷贝解析。
+### 5.2 `agent/collector.rs` — 采集引擎
 
----
+- **来源支持**：文件 tail、stdin、模拟生成器（Mock）
+- **解析策略**：JSON 对象 → Nginx 启发式 → 关键词降级
+- **线程模型**：独立采集线程 + `AtomicBool` 优雅停止 + mpsc channel 传递 `LogLine`
 
-### 4.2 `agent/collector.rs` —— 采集引擎（✅ 已完成）
+### 5.3 `agent/template.rs` — 模板提取与 XOR-P 编码 🆕
 
-**职责**：从文件/stdin/模拟源逐行采集，通过 mpsc channel 投递 `LogLine`。
+v0.2.0 新增模块，实现三层压缩预处理：
 
-**核心类型**：
-- `Collector`：运行时句柄，含线程句柄 + 停止标志
-- `CollectorConfig`：source + poll_interval + service_name
-- `SourceType::File{path}` / `Stdin` / `Mock{rate_per_sec, duration_sec}`
+1. **模板提取**：Batch 内按 token 数 + 结构签名聚类，自动识别参数位置
+   - 退化检测：当固定 Literal 过少时，按 token 类型模式子分组，防止不同消息类型错误合并
+   - 单条 fallback：无法聚类时作为完整 Literal 模板保留原始字符
+2. **强类型参数编码**：自动识别并二进制编码常见日志参数
+   - `Integer`（i64 LE）、`Hex`（u64 LE）、`IPv4`（4 B）、`IPv4Port`（6 B）、`BlockId`（9 B）、`Timestamp`（4 B）、`Path`
+   - 严格往返一致性保证：前导零、符号等边界情况全处理
+3. **64-bit XOR-P 编码**：ARM64 字长对齐，bitmap + literals 紧凑格式
+   - 参考行间隔可配置（默认 16 行），查询友好
+   - 参数数量/类型变化时自动重置参考行
+4. **PatternTable 序列化**：TLV 格式，支持磁盘持久化与零拷贝反序列化
 
-**解析策略**（按优先级）：
-1. JSON 对象：兼容标准字段（timestamp/service/level/message）和紧凑字段（t/s/l/m）
-2. Nginx 启发式：含 `HTTP/` 的行自动识别为 nginx 格式
-3. 降级：原始整行作为 message，关键词推断 level（ERROR->E, WARN->W, 其他->I）
+### 5.4 `agent/compressor.rs` — 压缩引擎
 
-**线程模型**：独立线程采集，`AtomicBool` 优雅停止，channel 缓冲无上限（由接收方背压控制）。
+- **预处理流水线**：Delta 时间戳 → 行间 RLE（`"*"` 引用上一条） → 服务名引用（`"$n"`）
+- **Zstd 压缩**：可配置压缩级别（0-22），支持训练字典
+- **接口**：`compress_batch()` / `decompress_batch()`，透明处理降熵/还原
 
----
+### 5.5 `agent/index.rs` — 索引引擎
 
-### 4.3 `agent/compressor.rs` —— 压缩引擎（✅ 已完成）
+- 内存常驻 Segment 元数据（`RwLock<Vec<ManifestEntry>>`）
+- 磁盘 Manifest 原子保存（`index/manifest.midx`）
+- 自愈：损坏时自动扫描 `segments/` 目录从文件头重建
+- 内存 <1 MB / 万条 Segment
 
-**职责**：预处理降熵 + Zstd 压缩/解压，专利安全。
+### 5.6 `agent/storage.rs` — 存储引擎
 
-**核心类型**：
-- `Compressor`：压缩/解压入口
-- `CompressorConfig`：zstd_level + enable_delta/enable_rle/enable_service_ref + dict
-- `DictTrainer`：从样本训练 Zstd 字典（提升模板日志压缩比 10-30%）
-
-**预处理流水线**：
-1. **Delta 时间戳**：首行存绝对值 `t`，后续存与上一行的差值 `d`（边缘日志间隔固定，delta 通常很小）
-2. **行间 RLE**：相邻行 message 完全相同时，标记为 `"*"` 引用上一行
-3. **服务名引用**：batch 内首次出现的服务名存全称，后续用 `"$n"` 引用
-
-**输出格式**（送 Zstd 前的文本）：
-```json
-{"t":1715424000000,"s":"nginx","l":"E","m":"timeout"}
-{"d":1000,"s":"$0","l":"I","m":"ok"}
-{"d":1000,"m":"*"}
+**写入流水线（v2 多 Chunk）：**
+```
+append -> WAL 追加（文本 json\n）
+       -> 内存缓冲
+       -> 阈值触发 flush()
+           -> drain 缓冲
+           -> TemplateExtractor::extract() 模板提取
+           -> TemplateExtractor::encode_xor() XOR-P 编码
+           -> 按 chunk_size（默认 256 行）切分 Chunk
+           -> 每 Chunk 计算 ChunkSummary（时间范围 + pattern_mask + param_bloom）
+           -> compressor.compress_batch() Zstd 压缩
+           -> 组装 Segment（PatternTable + ChunkTable + SummaryTable + Data）
+           -> 原子写入（tmp -> rename）
+           -> index.add_segment()
+           -> WAL truncate
 ```
 
-**接口**：
-- `compress_batch(&self, logs: &[LogLine]) -> Result<Vec<u8>>`
-- `decompress_batch(&self, data: &[u8]) -> Result<Vec<<LogLine>>`
-
----
-
-### 4.4 `agent/index.rs` —— 索引引擎（✅ 已完成）
-
-**职责**：内存常驻 Segment 元数据 + 磁盘 Manifest 持久化 + 目录自愈扫描。
-
-**核心类型**：
-- `Index`：线程安全（`RwLock<Vec<<ManifestEntry>>`）
-- `IndexStats`：segment_count / total_lines / min_ts / max_ts
-
-**内存占用**：每万 Segment 约 640KB（64 bytes × 10000），远低于 10MB 预算。
-
-**磁盘格式**：`index/manifest.midx` = `MIDX` 魔数(4B) + version(1B) + entry_count(4B) + Entry[](N×64B) + CRC32(4B)
-
-**关键行为**：
-- `open()`：优先加载 manifest，损坏时自动扫描 `segments/` 目录从文件头重建
-- `add_segment()`：追加 Entry，排序，原子保存
-- `query_range(start, end)`：返回时间重叠的 Segment（按 max_ts 降序，最新优先）
-- `next_segment_id()`：原子递增分配 ID
-
----
-
-### 4.5 `agent/storage.rs` —— 存储引擎（✅ 已重构）
-
-**职责**：WAL 双缓冲 + 原子 Segment 写入 + 流式查询，唯一持有 compressor 和 index 实例。
-
-**写入流水线**：
-```
-append(log)
-  -> WAL 文本追加（json\n，断电保护）
-  -> 入内存缓冲（Vec<<LogLine>）
-  -> 阈值触发（max_buffer_lines / max_buffer_bytes）
-  -> flush()
-     -> drain 缓冲
-     -> compressor.compress_batch()（降熵+Zstd）
-     -> 原子写入 Segment 文件（tmp -> rename）
-     -> index.add_segment()（注册元数据）
-     -> WAL truncate（数据已安全）
-```
-
-**查询流水线**：
+**查询流水线（两阶段过滤）：**
 ```
 query(start, end, keyword, limit)
-  -> index.query_range(start, end)（时间过滤，O(log N)）
+  -> index.query_range(start, end)           # 时间过滤，O(log N)
   -> 遍历 Segment（最新优先）
-     -> mmap 文件
-     -> SegmentHeader::from_bytes() 验证魔数+版本
-     -> ChunkEntry 时间二次过滤
-     -> SegmentFooter CRC 验证
-     -> compressor.decompress_batch()（流式解压）
-     -> 逐行关键词子串匹配（service/level/message）
-     -> 收集到 limit 为止
+     -> mmap Segment 文件
+     -> 读取 PatternTable, 构建 keyword -> pat_ids 映射
+     -> 遍历 ChunkSummary：
+        -> 时间范围过滤
+        -> pattern_mask 过滤（模板无关键字→跳过）
+        -> param_bloom 过滤（参数不匹配→跳过）
+     -> 仅对命中 Chunk 解压 + XOR-P 还原
+     -> 逐行关键词子串匹配
 ```
 
-**崩溃恢复**：
-- 启动时读取 `wal/current.wal`
-- 逐行解析 JSON，重放入缓冲
-- 立即 `flush()` 为 Segment
-- 截断 WAL
+**崩溃恢复：** 启动时读取 `wal/current.wal`，逐行重放→立即 `flush()`→截断 WAL
 
 ---
 
-### 4.6 `agent/mod.rs` —— 模块入口（✅ 已完成）
-
-重新导出公共类型，提供 `AgentHandle` 轻量封装（可选）。
-
----
-
-## 5. 存储目录布局（运行时）
+## 6. 存储目录布局
 
 ```
-/var/lib/mini-obs/          # data_dir
+/var/lib/mini-obs/              # data_dir
 ├── wal/
-│   └── current.wal          # 文本 JSON Lines，未 flush 的日志（通常 <5MB）
+│   └── current.wal             # 文本 JSON Lines，未 flush（<5 MB）
 ├── segments/
-│   ├── segment-00000001.mobs  # 只读压缩段（MOBS 格式）
+│   ├── segment-00000001.mobs   # 只读压缩段（MOBS 格式）
 │   ├── segment-00000002.mobs
 │   └── ...
 └── index/
-    └── manifest.midx        # 固定大小 Entry 数组，启动全量加载
+    └── manifest.midx           # 固定大小 Entry 数组
 ```
 
 ---
 
-## 6. 关键设计决策
+## 7. 依赖项
+
+| Crate | 版本 | 用途 |
+|-------|------|------|
+| `serde` + `serde_json` | 1.0 | 日志行 JSON 序列化 |
+| `zstd` | 0.13 | 压缩/解压（内部封装 ANS/FSE，专利安全） |
+| `crc32fast` | 1.3 | CRC32 校验（IEEE 802.3 多项式） |
+| `memmap2` | 0.9 | 零拷贝文件映射 |
+| `bincode` | 1.3 | 二进制序列化 |
+
+---
+
+## 8. 关键设计决策
 
 | 决策 | 理由 | 替代方案及未采用原因 |
-|------|------|-------------------|
-| **Zstd 而非原生 ANS** | 规避微软专利 US11234023B（2022-2039 有效） | rANS/tANS：压缩率更高但法律风险 |
-| **文本 WAL 而非二进制 WAL** | 崩溃时可人工修复，调试友好 | 二进制 WAL：体积小但不可读 |
-| **单 Chunk 单 Segment** | 简化实现，查询时整段解压 | 多 Chunk：支持段内范围查询，但复杂度翻倍 |
-| **JSON Lines 而非 MessagePack** | 人类可读，调试效率优先 | MessagePack：体积小 5%，但失去可读性 |
-| **内存索引而非磁盘 B-Tree** | 万级 Segment 内存 <1MB，查询快 | SQLite/RocksDB：引入外部依赖，体积大 |
-| **Mutex 而非 lock-free** | 单线程写入假设，简单可靠 | crossbeam：过度设计，增加编译时间 |
+|------|------|----------------------|
+| Zstd 而非原生 ANS | 规避微软专利 US11234023B（2022-2039 有效） | rANS/tANS：压缩率更高但法律风险 |
+| 文本 WAL 而非二进制 WAL | 崩溃时可人工修复，调试友好 | 二进制 WAL：体积小但不可读 |
+| 多 Chunk Segment（v2） | 段内时间切片 + ChunkSummary，查询时跳过无关 Chunk | 单 Chunk：简单但解压全段 |
+| JSON Lines 而非 MessagePack | 人类可读，调试效率优先 | MessagePack：体积小 5% 但失去可读性 |
+| 内存索引而非磁盘 B-Tree | 万级 Segment <1 MB，查询快 | SQLite/RocksDB：引入外部依赖 |
+| 模板提取 + XOR-P 编码 | 利用日志模板化特性进一步压缩，强类型参数更紧凑 | 纯 Zstd：无视日志领域特性 |
+| Mutex 而非 lock-free | 单线程写入假设，简单可靠 | crossbeam：过度设计 |
 
 ---
 
-## 7. Cargo.toml 配置
+## 9. 测试状态
 
-```toml
-[package]
-name = "mini-obs"
-version = "0.1.0"
-edition = "2021"
+| 模块 | 测试数 | 状态 |
+|------|--------|------|
+| `shared::format` | CRC + roundtrip + 对齐 | ✅ 全部通过 |
+| `agent::index` | 持久化 + 重建 + 范围查询 | ✅ 全部通过 |
+| `agent::collector` | 多格式解析 + mock 速率 + 背压 | ✅ 全部通过 |
+| `agent::compressor` | roundtrip + 压缩比 + 字典 + 模板集成 | ✅ 全部通过 |
+| `agent::template` | 类型检测 + XOR-P 往返 + 结构分组 + 边界 | ✅ 全部通过 |
+| `agent::storage` | 写-读-恢复 + 多 Segment + 高频追加 | ✅ 全部通过 |
+| 集成测试 | 端到端 + 压缩效果 + 模板诊断 | ✅ 146/147 通过 (1 个需外部数据文件) |
 
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-zstd = "0.13"
-crc32fast = "1.3"
-memmap2 = "0.9"
-bincode = "1.3"
+```bash
+# 测试结果（最近一次）
+test result: ok. 147 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
 ```
 
 ---
 
-## 8. 测试状态
+## 10. 待办事项
 
-| 模块 | 测试命令 | 状态 |
-|------|---------|------|
-| format | `cargo test shared::format` | ✅ 通过（roundtrip + CRC + 对齐） |
-| index | `cargo test agent::index` | ✅ 通过（持久化 + 重建 + 范围查询） |
-| collector | `cargo test agent::collector` | ✅ 通过（多格式解析 + mock 速率） |
-| compressor | `cargo test agent::compressor` | ✅ 通过（roundtrip + 压缩比 + 字典） |
-| storage | `cargo test agent::storage` | ✅ 通过（写-读-恢复 + 多 Segment） |
+### 高优先级
+- [ ] 树莓派 4B 性能基准测试（1000 QPS 稳定性、内存 RSS、压缩比）
+- [ ] 与 Loki / Fluent Bit 同数据集对比报告
+- [ ] Dockerfile + docker-compose.yml（含 aarch64 交叉编译）
 
----
+### 中优先级
+- [ ] HTTP API（axum）：`/query?start=&end=&keyword=` REST 接口
+- [ ] Prometheus Remote Write 兼容
+- [ ] Segment 后台合并（compaction）
 
-## 9. 待办清单（下一步工作）
-
-### 高优先级（课程项目必需）
-- [ ] **`src/main.rs` 实现**：CLI 参数解析（clap），支持 `agent` 子命令启动守护进程
-- [ ] **Docker 集成**：`Dockerfile` + `docker-compose.yml`，树莓派交叉编译验证
-- [ ] **性能基准测试**：在树莓派 4B 上实测 1000 QPS 稳定性、内存 RSS、压缩比
-- [ ] **与 Loki 对比报告**：同数据集下对比资源占用、压缩率、查询延迟
-
-### 中优先级（增强功能）
-- [ ] **多 Chunk Segment**：当前单 Chunk，未来支持段内时间切片（减少查询解压量）
-- [ ] **Succinct/Roaring Bitmap 索引**：替代当前逐行扫描，实现真正的免解压查询
-- [ ] **HTTP API 暴露**：axum/rocket 实现 `/query?start=&end=&keyword=` REST 接口
-- [ ] **Prometheus Remote Write 兼容**：将压缩后的 metrics 数据回传云端
-
-### 低优先级（长期演进）
-- [ ] **Segment 后台合并**：删除标记的 Segment 合并，回收空间
-- [ ] **eBPF 采集器**：绕过文件 IO，直接从内核采集日志
-- [ ] **ARM NEON 优化**：压缩/解压 SIMD 加速
+### 低优先级
+- [ ] eBPF 采集器（绕过文件 IO）
+- [ ] ARM NEON SIMD 加速
+- [ ] 自适应 Chunk 大小（根据数据特征动态调整）
 
 ---
 
-## 10. 关键接口速查
+## 11. 时间线
 
-```rust
-// 启动存储
-let engine = StorageEngine::open("/data/mini-obs", StorageConfig::default())?;
+| 提交 | 内容 |
+|------|------|
+| 2026-06-14 | 模板测试完善，修复模板匹配逻辑，二进制模板 |
+| 2026-06-14 | 批量测试，修复中断重启 bug |
+| 2026-05~06 | 多轮测试迭代 |
+| 2026-05-15 | 重建索引层，重构存储逻辑 (v2 多 Chunk) |
+| 2026-05-15 | GitHub Actions CI 配置 |
+| 2026-05-14 | v0.2.0 完善压缩策略，模板模块 |
+| 2026-05-14 | 完成 main.rs CLI |
+| 2026-05-13 | 重构日志采集与压缩引擎 |
+| 2026-05-12 | 项目初始化 |
 
-// 追加日志
-engine.append(LogLine { ts: now_ms(), service: "ngx".into(), level: "E".into(), message: "timeout".into() })?;
-
-// 强制刷盘（通常由 append 自动触发）
-engine.flush()?;
-
-// 查询
-let logs = engine.query(1715424000000, 1715424009999, "ERROR", 100)?;
-
-// 统计
-let stats = engine.stats();
-println!("Ratio: {:.2}x", stats.compression_ratio());
-```
 ---
+
+## 12. 许可证
+
+Apache-2.0 — 参见 [Cargo.toml](Cargo.toml)
+
+---
+
+*Mini-OBS: 把大厂的日志能力带到边缘，一个树莓派就够了。*
