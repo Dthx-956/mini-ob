@@ -1,4 +1,4 @@
-# Mini-OBS — 边缘原生轻量级日志管理系统
+# myDB — 边缘原生轻量级日志管理系统
 
 [![Rust](https://github.com/your-org/mini-obs/actions/workflows/rust.yml/badge.svg)](https://github.com/your-org/mini-obs/actions/workflows/rust.yml)
 ![Version](https://img.shields.io/badge/version-0.2.0-blue)
@@ -7,7 +7,7 @@
 
 ## 1. 项目简介
 
-Mini-OBS 是一个面向**资源受限边缘设备**（树莓派 4B 为基准硬件）的轻量级日志管理系统。
+一个面向**资源受限边缘设备**（树莓派 4B 为基准硬件）的轻量级日志管理系统。
 
 **核心目标**：在边缘侧实现 **>10x 压缩存储 + 秒级本地查询 + 崩溃自动恢复**，同时规避微软 ANS 专利（US11234023B）。
 
@@ -72,7 +72,7 @@ cargo test shared::format
 ## 3. 目录结构
 
 ```
-mini-obs/
+myDB/
 ├── Cargo.toml                         # 项目配置 (v0.2.0, edition 2021)
 ├── readme                             # 本文件
 ├── .github/workflows/rust.yml         # CI：构建 + 测试
